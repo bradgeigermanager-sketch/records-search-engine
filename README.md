@@ -16,6 +16,7 @@ A provenance-preserving search engine with a versioned STEM Wiki, typed STEM art
 - STEM Wiki with immutable page revisions, full-text search, discipline/language filters, tags, references, and provenance
 - Structured immutable STEM artifacts for equations, constants, algorithms, and experiments, with a JSON editor in the page view
 - Provenance-aware knowledge graph connecting wiki revisions and artifacts with typed, append-only relationships and bounded traversal
+- STEM artifact validation reports for missing definitions, units, sources, uncertainty, experiment controls, and limited declared-unit comparisons
 - Automated tests, GitHub Actions CI, and Docker Compose deployment
 
 ## Run locally
@@ -50,6 +51,8 @@ curl -X POST http://127.0.0.1:8000/wiki/pages/newton-second-law/artifacts -H 'Co
 curl 'http://127.0.0.1:8000/wiki/pages/newton-second-law/artifacts?artifact_type=equation'
 curl -X POST http://127.0.0.1:8000/wiki/edges -H 'Content-Type: application/json' -d '{"subject_kind":"page","subject_id":1,"predicate":"includes equation","object_kind":"artifact","object_id":1,"status":"proposed","confidence":0.9}'
 curl 'http://127.0.0.1:8000/wiki/graph/page/1?depth=2'
+curl -X POST http://127.0.0.1:8000/wiki/artifacts/1/validate
+curl 'http://127.0.0.1:8000/wiki/artifacts/1/validation-reports'
 curl 'http://127.0.0.1:8000/sources'
 curl 'http://127.0.0.1:8000/documents?include_history=true'
 ```
@@ -63,4 +66,5 @@ Submit only sources you are authorized to retrieve; respect site terms, robots p
 3. Structured metadata filters for search and document listing — implemented in v0.4.0
 4. STEM Wiki — implemented in v0.5.0
 5. Structured STEM artifacts — implemented in v0.6.0
-6. PostgreSQL migration, archive connectors, language detection, timelines, and evidence-conflict views
+6. STEM validation reports — implemented in v0.8.0 (screening aid; not a proof of correctness)
+7. PostgreSQL migration, archive connectors, language detection, timelines, and evidence-conflict views
