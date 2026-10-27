@@ -510,7 +510,7 @@ def test_github_owner_search_and_source_navigation(client):
     first = search_app.save_document(
         'https://github.com/example-owner/process-a/blob/main/README.md',
         'example-owner/process-a: README.md',
-        'Canonical process library describes evidence provenance and repeatable records.',
+        'Canonical process library describes source provenance and repeatable records.',
         200, 'text/plain; charset=utf-8',
         {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'process-a',
          'ref': 'main', 'path': 'README.md', 'repository_url': 'https://github.com/example-owner/process-a'})
