@@ -220,3 +220,19 @@ def test_wiki_revisions_are_immutable(client):
             conn.execute('UPDATE wiki_page_revisions SET title=? WHERE id=?', ('Edited in place', revision_id))
         with pytest.raises(sqlite3.IntegrityError, match='immutable'):
             conn.execute('DELETE FROM wiki_page_revisions WHERE id=?', (revision_id,))
+
+
+def test_stem_wiki_browser_pages_and_migration(client):
+    assert client.get('/wiki').status_code == 200
+    assert 'Create a page' in client.get('/wiki').text
+    assert client.get('/wiki/view/missing-page').status_code == 200
+    client.post('/wiki/pages', json={
+        'slug': 'basic-algebra', 'title': 'Basic Algebra',
+        'body': 'A branch of mathematics using symbols and equations.',
+        'discipline': 'mathematics'
+    })
+    view = client.get('/wiki/view/basic-algebra')
+    assert view.status_code == 200 and 'STEM Wiki Page' in view.text
+    search_app.init_db()
+    with search_app.connection() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM schema_migrations WHERE version=3').fetchone()[0] == 1
