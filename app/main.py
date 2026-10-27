@@ -14,8 +14,8 @@ APP_NAME = "Records Search Engine"
 DB_PATH = os.getenv("SEARCH_DB_PATH", "search.db")
 MAX_BYTES = 2_000_000
 TIMEOUT_SECONDS = 12
-USER_AGENT = "RecordsSearchEngine/0.3 (+responsible research; contact site operator before bulk use)"
-app = FastAPI(title=APP_NAME, version="0.3.0", description="Provenance-preserving web-record search prototype")
+USER_AGENT = "RecordsSearchEngine/0.4 (+responsible research; contact site operator before bulk use)"
+app = FastAPI(title=APP_NAME, version="0.4.0", description="Provenance-preserving web-record search prototype")
 
 class IngestRequest(BaseModel):
     url: HttpUrl
