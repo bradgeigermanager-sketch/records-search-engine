@@ -175,3 +175,14 @@ curl 'http://127.0.0.1:8000/search?q=auth&mode=prefix&field=title'
 curl 'http://127.0.0.1:8000/github/search?q=dependency&mode=any&field=body'
 ```
 
+
+## Relevance ranking and match explanations
+
+Search now weights title matches more heavily than body-only matches in SQLite FTS5 ranking. This applies to both `/search` and `/github/search`, while preserving the selected matching mode, field scope, current-version behavior, metadata filters, and repository filters.
+
+Each result includes:
+- `matched_terms`: query terms found in the eligible title/body fields (prefix-aware in prefix mode).
+- `match_reasons`: human-readable explanation such as title matches, body matches, or a full-query/phrase occurrence.
+- `relevance_score`: a transparent rule-based score from 0 to 100. It is a ranking aid, **not** a probability, truth rating, or source-quality assessment.
+
+The score favors query-term coverage in titles, then body text, with a phrase bonus. FTS5's weighted ranking orders the results; the explanation fields show why each result matched. A high score does not validate a source's claims.
