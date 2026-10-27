@@ -116,3 +116,14 @@ Every candidate includes its two file endpoints, score, evidence categories, and
 - Graph nodes include source and version-history navigation. Edge provenance records the reviewed source versions and the review rationale/evidence snapshot when the edge was accepted.
 
 Review decisions and relationship records are append-only. A later disagreement should be recorded as another review, not as an edit to an earlier decision. The graph API returns data for a visualization client; it does not itself draw an interactive graph.
+
+## Relationship evidence change detection
+
+When an indexed source receives a new content version, the system appends an immutable change event for each stored relationship touching that source. The event records the previous and current version IDs and content hashes, the version captured by the relationship review when available, and a recommendation for human revalidation. It does **not** automatically reject, delete, or silently rewrite the relationship.
+
+- `GET /github/relationship-change-events?owner=YOUR_OWNER` lists change events involving the owner's repositories.
+- Add `relationship_id=123` or `source_id=456` to narrow the results.
+- Events are append-only and duplicate detection is guarded by a unique relationship/source/current-version key.
+- An unchanged re-ingestion does not create a new document version or a relationship change event.
+
+These events indicate that evidence may be stale; they do not establish that a relationship is false. The next review workflow can record a fresh decision against the new exact versions.
