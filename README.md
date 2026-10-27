@@ -55,6 +55,5 @@ Submit only sources you are authorized to retrieve; respect site terms, robots p
 1. Source registry, immutable versions, and ingestion logs — implemented in v0.2.0
 2. Typed entity registry, relationships, and append-only metadata — implemented in v0.3.0
 3. Structured metadata filters for search and document listing — implemented in v0.4.0
-4. PostgreSQL migration and archive connectors with respectful scheduled retrieval
 4. STEM Wiki — implemented in v0.5.0
 5. PostgreSQL migration, archive connectors, language detection, timelines, and evidence-conflict views
