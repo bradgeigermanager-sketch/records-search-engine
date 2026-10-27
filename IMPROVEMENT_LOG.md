@@ -95,3 +95,12 @@ Copy this section for each substantive action:
 - **Status:** `IN_PROGRESS`; do not mark schema/fixture `VERIFIED` until the workflow completes successfully and negative cases are tested.
 - **Design constraint:** The schema prevents a set of non-duplicate relationship classes from being marked `ELIGIBLE`, but this is an initial guardrail, not a complete policy engine or merge authorization mechanism.
 - **Next:** Confirm the workflow result; add invalid examples (for example, an independent observation marked eligible); align the procedure's decision table with the machine vocabulary.
+
+
+### `LOG-2026-10-26-010` — Fix CI-detected JSON syntax error and add a negative regression check
+- **Repository:** [Records-Deduplication-Suite](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite)
+- **Action:** The first CI run caught malformed JSON in the new assessment schema. Rewrote the conditional constraint clearly, confirmed JSON parsing, and added a negative check that an `INDEPENDENT_OBSERVATION` assessment marked `ELIGIBLE` must be rejected.
+- **Commits:** [Schema fix](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/commit/4fd9915a749c91ddb134b02656b0ff66e49f8cce); [negative regression check](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/commit/09bad51b2d10dc9529b16dd83616c0cead6e6873).
+- **Verification:** [Run 40453548665](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453548665) passed the Draft 2020-12 schema checks and valid assessment fixture. [Run 40453561754](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453561754) includes the new negative check and is pending final confirmation.
+- **Result:** The initial failure was useful: it demonstrated that the CI job fails on malformed schema JSON rather than silently accepting it. Do not mark the negative regression as verified until its run completes successfully.
+- **Next:** Confirm the latest run, add more invalid cases for missing required fields and out-of-range confidence, then reconcile the procedural decision table with the machine vocabulary.
