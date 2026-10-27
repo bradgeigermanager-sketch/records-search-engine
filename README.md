@@ -130,6 +130,12 @@ These events indicate that evidence may be stale; they do not establish that a r
 
 ## Relationship revalidation and resolution
 
+### Exact-version comparison
+
+Use `GET /github/relationship-change-comparisons?event_id=123` to inspect the exact previous/current versions referenced by a change event. The response contains a unified line diff, version IDs, SHA-256 hashes, added/removed line counts, and a bounded excerpt of the other relationship endpoint's current version for context. Output is bounded by `max_diff_lines` (default 1,500; maximum 5,000) and the other-endpoint excerpt by `context_chars` (default 12,000; maximum 30,000). A `stored_hashes_match_versions` flag checks that event hashes match the version records.
+
+The explorer's **Compare exact source versions** control loads this diff and context. This is a textual comparison, not a semantic judgement; reviewers should inspect the linked source files and decide whether the relationship remains supported. A truncated diff reports its limit and should not be treated as a complete comparison.
+
 The browser explorer at `/github/explorer` also displays unresolved change events and provides controls to reaffirm, revise, dispute, or mark a relationship no longer supported. It includes the old/current version IDs and content hashes for review. Reviewers should open and compare the source files before submitting a decision; the UI's evidence snapshot is a record of the displayed version identifiers, not an automatic semantic diff.
 
 When a source-change event exists, a reviewer can record one immutable revalidation decision with `POST /github/relationship-revalidations`. The request includes `event_id`, `decision`, and a required `rationale`; it can also include reviewer, predicate, confidence, evidence snapshot, and provenance.
