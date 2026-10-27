@@ -805,3 +805,12 @@ def test_relationship_revalidation_rejects_duplicate_decision_for_same_event(cli
     payload = {'event_id': event['event_id'], 'decision': 'disputed', 'rationale': 'Need further review.'}
     assert client.post('/github/relationship-revalidations', json=payload).status_code == 200
     assert client.post('/github/relationship-revalidations', json=payload).status_code == 409
+
+
+def test_explorer_includes_stale_evidence_revalidation_controls(client):
+    response = client.get('/github/explorer')
+    assert response.status_code == 200
+    assert 'Stale evidence awaiting review' in response.text
+    assert '/github/relationship-change-events' in response.text
+    assert '/github/relationship-revalidations' in response.text
+    assert 'no_longer_supported' in response.text
