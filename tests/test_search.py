@@ -297,3 +297,56 @@ def test_stem_artifact_validation_and_immutability(client):
             conn.execute('UPDATE stem_artifacts SET name=? WHERE id=?', ('Mutated', artifact_id))
         with pytest.raises(sqlite3.IntegrityError, match='immutable'):
             conn.execute('DELETE FROM stem_artifacts WHERE id=?', (artifact_id,))
+
+
+def test_stem_knowledge_edges_and_graph_traversal(client):
+    page = client.post('/wiki/pages', json={
+        'slug': 'graph-law', 'title': 'Newton Second Law', 'body': 'Force equals mass times acceleration.',
+        'discipline': 'physics'
+    }).json()
+    artifact = client.post('/wiki/pages/graph-law/artifacts', json={
+        'artifact_type': 'equation', 'name': 'Force equation',
+        'data': {'expression': 'F = m * a', 'variables': [
+            {'symbol': 'F', 'meaning': 'net force', 'unit': 'N'},
+            {'symbol': 'm', 'meaning': 'mass', 'unit': 'kg'},
+            {'symbol': 'a', 'meaning': 'acceleration', 'unit': 'm/s^2'}
+        ]}
+    }).json()
+    edge = client.post('/wiki/edges', json={
+        'subject_kind': 'page', 'subject_id': page['revision_id'], 'predicate': 'includes equation',
+        'object_kind': 'artifact', 'object_id': artifact['artifact_id'],
+        'evidence_page_revision_id': page['revision_id'], 'confidence': 0.9,
+        'status': 'proposed', 'provenance': {'basis': 'editor assertion'}
+    })
+    assert edge.status_code == 200
+    assert edge.json()['predicate'] == 'includes_equation'
+    listed = client.get('/wiki/edges', params={'subject_kind': 'page', 'subject_id': page['revision_id']})
+    assert listed.status_code == 200 and len(listed.json()) == 1
+    graph = client.get(f"/wiki/graph/page/{page['revision_id']}")
+    assert graph.status_code == 200
+    assert {n['kind'] for n in graph.json()['nodes']} == {'page', 'artifact'}
+    assert graph.json()['edges'][0]['status'] == 'proposed'
+
+def test_stem_knowledge_edge_validation_and_immutability(client):
+    page = client.post('/wiki/pages', json={
+        'slug': 'graph-checks', 'title': 'Graph checks', 'body': 'Graph tests.', 'discipline': 'mathematics'
+    }).json()
+    bad = client.post('/wiki/edges', json={
+        'subject_kind': 'person', 'subject_id': 1, 'predicate': 'uses',
+        'object_kind': 'page', 'object_id': page['revision_id']
+    })
+    assert bad.status_code == 422
+    missing = client.post('/wiki/edges', json={
+        'subject_kind': 'page', 'subject_id': page['revision_id'], 'predicate': 'uses',
+        'object_kind': 'artifact', 'object_id': 9999
+    })
+    assert missing.status_code == 404
+    created = client.post('/wiki/edges', json={
+        'subject_kind': 'page', 'subject_id': page['revision_id'], 'predicate': 'related to',
+        'object_kind': 'page', 'object_id': page['revision_id']
+    }).json()
+    with search_app.connection() as conn:
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('UPDATE knowledge_edges SET status=? WHERE id=?', ('supported', created['edge_id']))
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('DELETE FROM knowledge_edges WHERE id=?', (created['edge_id'],))
