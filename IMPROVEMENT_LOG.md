@@ -130,3 +130,10 @@ Copy this section for each substantive action:
 - **Commits:** [Record fixture](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/commit/b3dcb7ef35bccda26f22606bf4cca3051b850304); [expanded workflow](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/commit/b97f665e6d040b4bc193edc150d900394669b249).
 - **Verification:** Previous assessment-schema checks passed in [run 40453597735](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453597735). The new record-fixture run and expanded workflow result remain pending at the time of this entry.
 - **Next:** Confirm the latest workflow; if green, add relationship/action compatibility cases and then inspect the next unreviewed repository from the owner inventory.
+
+
+### `LOG-2026-10-26-014` — Confirm record and assessment schema regression suite passes
+- **Repository:** [Records-Deduplication-Suite](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite)
+- **Verification:** [GitHub Actions run 40453716437](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453716437) completed successfully. It checked both schemas against Draft 2020-12, validated the record and assessment fixtures, and confirmed rejection of unsafe eligibility, missing rationale, out-of-range confidence, and loss of original-value preservation.
+- **Status:** VERIFIED for these schema/fixture checks only. This does not establish correctness of a future deduplication engine or exhaustive coverage of the policy table.
+- **Next:** Add relationship/action compatibility cases, run link/path checks, then continue owner-wide repository inspection.
