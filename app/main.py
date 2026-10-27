@@ -15,7 +15,7 @@ DB_PATH = os.getenv("SEARCH_DB_PATH", "search.db")
 MAX_BYTES = 2_000_000
 TIMEOUT_SECONDS = 12
 USER_AGENT = "RecordsSearchEngine/0.11 (+responsible research; contact site operator before bulk use)"
-app = FastAPI(title=APP_NAME, version="0.14.0", description="Provenance-preserving web-record search prototype")
+app = FastAPI(title=APP_NAME, version="0.15.0", description="Provenance-preserving web-record search prototype")
 
 class IngestRequest(BaseModel):
     url: HttpUrl
@@ -395,6 +395,30 @@ def init_db():
             """)
             conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(8,?)", (utc_now(),))
 
+        if 10 not in applied:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS relationship_change_events (
+                id INTEGER PRIMARY KEY,
+                relationship_id INTEGER NOT NULL REFERENCES repository_relationships(id),
+                source_id INTEGER NOT NULL REFERENCES sources(id),
+                previous_version_id INTEGER NOT NULL REFERENCES document_versions(id),
+                current_version_id INTEGER NOT NULL REFERENCES document_versions(id),
+                previous_content_hash TEXT NOT NULL,
+                current_content_hash TEXT NOT NULL,
+                reviewed_version_id INTEGER,
+                relationship_status TEXT NOT NULL,
+                predicate TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(relationship_id,source_id,current_version_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_relationship_change_events_rel ON relationship_change_events(relationship_id,created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_relationship_change_events_source ON relationship_change_events(source_id,created_at DESC);
+            CREATE TRIGGER IF NOT EXISTS relationship_change_events_no_update BEFORE UPDATE ON relationship_change_events BEGIN SELECT RAISE(ABORT,'relationship change events are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS relationship_change_events_no_delete BEFORE DELETE ON relationship_change_events BEGIN SELECT RAISE(ABORT,'relationship change events are immutable'); END;
+            """)
+            conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(10,?)", (utc_now(),))
+
 @app.on_event("startup")
 def startup():
     init_db()
@@ -438,6 +462,22 @@ def save_document(url,title,body,status,content_type,provenance=None,extraction_
             vnum=cur["version_number"]+1 if cur else 1
             ins=conn.execute("INSERT INTO document_versions(source_id,version_number,title,body,content_hash,retrieved_at,http_status,content_type,extraction_status,provenance_json) VALUES(?,?,?,?,?,?,?,?,?,?)",(sid,vnum,title,body,digest,now,status,content_type,extraction_status,pjson))
             vid=ins.lastrowid; conn.execute("UPDATE sources SET current_version_id=? WHERE id=?",(vid,sid)); outcome="created" if cur is None else "changed"
+        if cur and outcome == "changed":
+            # Preserve an audit event for every relationship touching a source whose current version changed.
+            related = conn.execute("""SELECT id,from_source_id,to_source_id,predicate,status,provenance_json
+                FROM repository_relationships WHERE from_source_id=? OR to_source_id=? ORDER BY id""", (sid, sid)).fetchall()
+            for rel in related:
+                rel_provenance = json.loads(rel["provenance_json"] or "{}")
+                version_snapshot = rel_provenance.get("source_versions") or {}
+                side = "from" if rel["from_source_id"] == sid else "to"
+                expected_version_id = version_snapshot.get(side)
+                conn.execute("""INSERT OR IGNORE INTO relationship_change_events
+                    (relationship_id,source_id,previous_version_id,current_version_id,previous_content_hash,current_content_hash,
+                     reviewed_version_id,relationship_status,predicate,reason,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (rel["id"], sid, cur["id"], vid, cur["content_hash"], digest, expected_version_id,
+                     rel["status"], rel["predicate"],
+                     "Source content changed after relationship creation/review; human revalidation recommended.", now))
         conn.execute("UPDATE sources SET last_seen_at=?,provenance_json=? WHERE id=?",(now,pjson,sid))
         conn.execute("INSERT INTO ingestion_events(source_id,occurred_at,outcome,content_hash,version_id,http_status,content_type,extraction_status,details_json) VALUES(?,?,?,?,?,?,?,?,?)",(sid,now,outcome,digest,vid,status,content_type,extraction_status,pjson))
         return {"source_id":sid,"document_id":vid,"version_id":vid,"version_number":vnum,"title":title,"url":url,"retrieved_at":now,"content_hash":digest,"outcome":outcome,"is_current":True,"extraction_status":extraction_status}
@@ -1585,6 +1625,48 @@ def wiki_home():
 @app.get("/",response_class=HTMLResponse)
 def home():
     return HTMLResponse("""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Records Search Engine</title><style>body{font:16px system-ui;max-width:900px;margin:3rem auto;padding:0 1rem;color:#202124}input{padding:.7rem;width:min(65%,520px)}button{padding:.75rem;cursor:pointer}.muted{color:#666}.result{border-top:1px solid #ddd;padding:1rem 0}</style></head><body><h1>Records Search Engine</h1><p><a href="/wiki">Open STEM Wiki</a> · <a href="/github/explorer">Open GitHub Relationship Explorer</a></p><p class="muted">Search indexed web records or add a public HTML page. Source versions are preserved.</p><form id="search"><input id="q" placeholder="Search indexed records" required><label><input id="history" type="checkbox" style="width:auto"> Include historical versions</label><button>Search</button></form><h2>Add a source</h2><form id="ingest"><input id="url" type="url" placeholder="https://example.org/page" required><button>Index URL</button></form><p id="status" class="muted"></p><section id="results"></section><script>const status=document.querySelector('#status'),results=document.querySelector('#results');document.querySelector('#search').addEventListener('submit',async e=>{e.preventDefault();status.textContent='Searching…';results.replaceChildren();const q=document.querySelector('#q').value,history=document.querySelector('#history').checked,r=await fetch('/search?q='+encodeURIComponent(q)+'&include_history='+history),data=await r.json();status.textContent=data.length+' result(s)';for(const x of data){const el=document.createElement('article');el.className='result';const h=document.createElement('h3'),a=document.createElement('a');a.href=x.url;a.target='_blank';a.rel='noopener noreferrer';a.textContent=x.title;h.append(a);const p=document.createElement('p');p.textContent=x.excerpt.replace(/<\/?mark>/g,'');const s=document.createElement('small');s.textContent='Source #'+x.source_id+' · Version '+x.version_number+(x.is_current?' (current)':' (historical)');el.append(h,p,s);results.append(el)}});document.querySelector('#ingest').addEventListener('submit',async e=>{e.preventDefault();status.textContent='Retrieving and indexing…';const r=await fetch('/ingest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:document.querySelector('#url').value})}),data=await r.json();status.textContent=r.ok?'Indexed: '+data.title+' ('+data.outcome+')':(data.detail||'Ingestion failed')});</script></body></html>""")
+
+
+
+@app.get("/github/relationship-change-events")
+def list_github_relationship_change_events(owner: str | None = None,
+                                           relationship_id: int | None = Query(default=None, ge=1),
+                                           source_id: int | None = Query(default=None, ge=1),
+                                           limit: int = Query(default=100, ge=1, le=500)):
+    """List immutable source-change events that may invalidate relationship evidence."""
+    clauses = ["1=1"]
+    params = []
+    if owner:
+        clauses.append("""(lower(json_extract(fs.provenance_json,'$.owner'))=lower(?)
+            OR lower(json_extract(ts.provenance_json,'$.owner'))=lower(?))""")
+        params.extend([owner.strip(), owner.strip()])
+    if relationship_id is not None:
+        clauses.append("e.relationship_id=?")
+        params.append(relationship_id)
+    if source_id is not None:
+        clauses.append("e.source_id=?")
+        params.append(source_id)
+    params.append(limit)
+    with connection() as conn:
+        rows = conn.execute("""SELECT e.*,fs.canonical_url from_url,ts.canonical_url to_url,
+            sv.title source_title,json_extract(sv.provenance_json,'$.path') source_path,
+            json_extract(s.provenance_json,'$.repository') source_repository
+            FROM relationship_change_events e
+            JOIN repository_relationships rr ON rr.id=e.relationship_id
+            JOIN sources fs ON fs.id=rr.from_source_id JOIN sources ts ON ts.id=rr.to_source_id
+            JOIN sources s ON s.id=e.source_id
+            JOIN document_versions sv ON sv.id=e.current_version_id
+            WHERE """ + " AND ".join(clauses) +
+            " ORDER BY e.created_at DESC,e.id DESC LIMIT ?", params).fetchall()
+    return [{"event_id": r["id"], "relationship_id": r["relationship_id"], "source_id": r["source_id"],
+        "source_repository": r["source_repository"], "source_path": r["source_path"],
+        "source_title": r["source_title"], "from_url": r["from_url"], "to_url": r["to_url"],
+        "previous_version_id": r["previous_version_id"], "current_version_id": r["current_version_id"],
+        "reviewed_version_id": r["reviewed_version_id"],
+        "previous_content_hash": r["previous_content_hash"], "current_content_hash": r["current_content_hash"],
+        "relationship_status_at_change": r["relationship_status"], "predicate": r["predicate"],
+        "reason": r["reason"], "created_at": r["created_at"],
+        "revalidation_recommended": True} for r in rows]
 
 
 @app.get("/github/explorer", response_class=HTMLResponse)
