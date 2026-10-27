@@ -14,8 +14,8 @@ APP_NAME = "Records Search Engine"
 DB_PATH = os.getenv("SEARCH_DB_PATH", "search.db")
 MAX_BYTES = 2_000_000
 TIMEOUT_SECONDS = 12
-USER_AGENT = "RecordsSearchEngine/0.5 (+responsible research; contact site operator before bulk use)"
-app = FastAPI(title=APP_NAME, version="0.5.0", description="Provenance-preserving web-record search prototype")
+USER_AGENT = "RecordsSearchEngine/0.6 (+responsible research; contact site operator before bulk use)"
+app = FastAPI(title=APP_NAME, version="0.6.0", description="Provenance-preserving web-record search prototype")
 
 class IngestRequest(BaseModel):
     url: HttpUrl
@@ -39,6 +39,37 @@ class RelationshipCreate(BaseModel):
     source_id: int | None = None
     evidence_version_id: int | None = None
     confidence: float | None = None
+    provenance: dict = {}
+
+class WikiPageCreate(BaseModel):
+    slug: str
+    title: str
+    body: str
+    discipline: str
+    summary: str = ""
+    language: str = "en"
+    tags: list[str] = []
+    references: list[dict] = []
+    author: str = ""
+    change_note: str = "Initial page"
+    provenance: dict = {}
+
+class WikiRevisionCreate(BaseModel):
+    title: str
+    body: str
+    discipline: str
+    summary: str = ""
+    language: str = "en"
+    tags: list[str] = []
+    references: list[dict] = []
+    author: str = ""
+    change_note: str = ""
+    provenance: dict = {}
+
+class STEMArtifactCreate(BaseModel):
+    artifact_type: str
+    name: str
+    data: dict
     provenance: dict = {}
 
 class SearchResult(BaseModel):
@@ -179,6 +210,56 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_relationship_object ON entity_relationships(object_entity_id);
             """)
             conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(2,?)", (utc_now(),))
+        if 3 not in applied:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS wiki_pages (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL UNIQUE,
+                current_revision_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS wiki_page_revisions (
+                id INTEGER PRIMARY KEY,
+                page_id INTEGER NOT NULL REFERENCES wiki_pages(id),
+                revision_number INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL,
+                language TEXT NOT NULL DEFAULT 'en',
+                discipline TEXT NOT NULL,
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                references_json TEXT NOT NULL DEFAULT '[]',
+                author TEXT NOT NULL DEFAULT '',
+                change_note TEXT NOT NULL DEFAULT '',
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                UNIQUE(page_id, revision_number)
+            );
+            CREATE INDEX IF NOT EXISTS idx_wiki_revisions_page ON wiki_page_revisions(page_id, revision_number DESC);
+            CREATE INDEX IF NOT EXISTS idx_wiki_pages_updated ON wiki_pages(updated_at DESC);
+            CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5(slug, title, summary, body, tags, tokenize='unicode61');
+            CREATE TRIGGER IF NOT EXISTS wiki_revisions_no_update BEFORE UPDATE ON wiki_page_revisions BEGIN SELECT RAISE(ABORT,'wiki revisions are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS wiki_revisions_no_delete BEFORE DELETE ON wiki_page_revisions BEGIN SELECT RAISE(ABORT,'wiki revisions are immutable'); END;
+            """)
+            conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(3,?)", (utc_now(),))
+        if 4 not in applied:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS stem_artifacts (
+                id INTEGER PRIMARY KEY,
+                page_id INTEGER NOT NULL REFERENCES wiki_pages(id),
+                page_revision_id INTEGER NOT NULL REFERENCES wiki_page_revisions(id),
+                artifact_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                data_json TEXT NOT NULL,
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_stem_artifacts_page ON stem_artifacts(page_id, artifact_type, created_at DESC);
+            CREATE TRIGGER IF NOT EXISTS stem_artifacts_no_update BEFORE UPDATE ON stem_artifacts BEGIN SELECT RAISE(ABORT,'STEM artifacts are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS stem_artifacts_no_delete BEFORE DELETE ON stem_artifacts BEGIN SELECT RAISE(ABORT,'STEM artifacts are immutable'); END;
+            """)
+            conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(4,?)", (utc_now(),))
 
 @app.on_event("startup")
 def startup():
@@ -432,6 +513,66 @@ def create_relationship(request: RelationshipCreate):
             "object_literal": request.object_literal, "source_id": request.source_id,
             "evidence_version_id": request.evidence_version_id, "confidence": request.confidence,
             "provenance": request.provenance, "created_at": now}
+
+def _validate_stem_artifact(artifact_type: str, data: dict):
+    required = {
+        "equation": {"expression", "variables"},
+        "constant": {"value", "unit"},
+        "algorithm": {"pseudocode", "inputs", "outputs"},
+        "experiment": {"procedure", "independent_variables", "dependent_variables"},
+    }
+    if artifact_type not in required:
+        raise HTTPException(status_code=422, detail="artifact_type must be equation, constant, algorithm, or experiment")
+    missing = sorted(required[artifact_type] - set(data))
+    if missing:
+        raise HTTPException(status_code=422, detail=f"Missing required data fields: {', '.join(missing)}")
+    if artifact_type == "equation" and not isinstance(data.get("variables"), list):
+        raise HTTPException(status_code=422, detail="equation variables must be a list of variable definitions")
+    if artifact_type == "constant":
+        if not isinstance(data.get("value"), (int, float, str)) or not str(data.get("unit", "")).strip():
+            raise HTTPException(status_code=422, detail="constant requires a numeric/text value and non-empty unit")
+    if artifact_type == "algorithm" and not isinstance(data.get("pseudocode"), str):
+        raise HTTPException(status_code=422, detail="algorithm pseudocode must be a string")
+    if artifact_type == "experiment" and not isinstance(data.get("procedure"), list):
+        raise HTTPException(status_code=422, detail="experiment procedure must be a list of steps")
+
+@app.post("/wiki/pages/{slug}/artifacts")
+def create_stem_artifact(slug: str, request: STEMArtifactCreate):
+    slug = _wiki_slug(slug)
+    name = request.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="artifact name must not be blank")
+    _validate_stem_artifact(request.artifact_type, request.data)
+    with connection() as conn:
+        page = conn.execute("SELECT id,current_revision_id FROM wiki_pages WHERE slug=?", (slug,)).fetchone()
+        if not page:
+            raise HTTPException(status_code=404, detail="Wiki page not found")
+        now = utc_now()
+        cur = conn.execute("""INSERT INTO stem_artifacts(page_id,page_revision_id,artifact_type,name,data_json,provenance_json,created_at)
+            VALUES(?,?,?,?,?,?,?)""", (page["id"], page["current_revision_id"], request.artifact_type, name,
+            json.dumps(request.data, ensure_ascii=False, sort_keys=True),
+            json.dumps(request.provenance, ensure_ascii=False, sort_keys=True), now))
+        artifact_id = cur.lastrowid
+    return {"artifact_id": artifact_id, "page_slug": slug, "page_revision_id": page["current_revision_id"],
+            "artifact_type": request.artifact_type, "name": name, "data": request.data,
+            "provenance": request.provenance, "created_at": now}
+
+@app.get("/wiki/pages/{slug}/artifacts")
+def list_stem_artifacts(slug: str, artifact_type: str | None = None, include_history: bool = False):
+    slug = _wiki_slug(slug)
+    clauses, params = ["p.slug=?"], [slug]
+    if artifact_type:
+        clauses.append("a.artifact_type=?"); params.append(artifact_type)
+    if not include_history:
+        clauses.append("a.page_revision_id=p.current_revision_id")
+    with connection() as conn:
+        if not conn.execute("SELECT 1 FROM wiki_pages WHERE slug=?", (slug,)).fetchone():
+            raise HTTPException(status_code=404, detail="Wiki page not found")
+        rows = conn.execute("""SELECT a.id artifact_id,p.slug page_slug,a.page_revision_id,a.artifact_type,a.name,a.data_json,a.provenance_json,a.created_at
+            FROM stem_artifacts a JOIN wiki_pages p ON p.id=a.page_id WHERE """ + " AND ".join(clauses) + " ORDER BY a.created_at DESC,a.id DESC", params).fetchall()
+    return [{"artifact_id": r["artifact_id"], "page_slug": r["page_slug"], "page_revision_id": r["page_revision_id"],
+             "artifact_type": r["artifact_type"], "name": r["name"], "data": json.loads(r["data_json"]),
+             "provenance": json.loads(r["provenance_json"]), "created_at": r["created_at"]} for r in rows]
 
 def _wiki_slug(value: str) -> str:
     import re
