@@ -236,3 +236,63 @@ def test_stem_wiki_browser_pages_and_migration(client):
     search_app.init_db()
     with search_app.connection() as conn:
         assert conn.execute('SELECT COUNT(*) FROM schema_migrations WHERE version=3').fetchone()[0] == 1
+
+
+def test_stem_artifact_equation_constant_algorithm_and_experiment(client):
+    page = client.post('/wiki/pages', json={
+        'slug': 'stem-artifact-host', 'title': 'STEM Artifacts',
+        'body': 'A page hosting structured STEM records.', 'discipline': 'engineering'
+    })
+    assert page.status_code == 200
+
+    equation = client.post('/wiki/pages/stem-artifact-host/artifacts', json={
+        'artifact_type': 'equation', 'name': 'Newton second law',
+        'data': {'expression': 'F = m * a', 'variables': [
+            {'symbol': 'F', 'meaning': 'net force', 'unit': 'N'},
+            {'symbol': 'm', 'meaning': 'mass', 'unit': 'kg'},
+            {'symbol': 'a', 'meaning': 'acceleration', 'unit': 'm/s^2'}
+        ]},
+        'provenance': {'status': 'review_required'}
+    })
+    assert equation.status_code == 200
+    assert equation.json()['data']['expression'] == 'F = m * a'
+
+    constant = client.post('/wiki/pages/stem-artifact-host/artifacts', json={
+        'artifact_type': 'constant', 'name': 'Standard gravity (illustrative)',
+        'data': {'value': 9.80665, 'unit': 'm/s^2', 'uncertainty': 'context-dependent'}
+    })
+    algorithm = client.post('/wiki/pages/stem-artifact-host/artifacts', json={
+        'artifact_type': 'algorithm', 'name': 'Sum a list',
+        'data': {'pseudocode': 'total <- sum(values)', 'inputs': ['values'], 'outputs': ['total']}
+    })
+    experiment = client.post('/wiki/pages/stem-artifact-host/artifacts', json={
+        'artifact_type': 'experiment', 'name': 'Measure acceleration',
+        'data': {'procedure': ['Record distance', 'Measure elapsed time'], 'independent_variables': ['distance'], 'dependent_variables': ['elapsed time']}
+    })
+    assert constant.status_code == algorithm.status_code == experiment.status_code == 200
+    all_artifacts = client.get('/wiki/pages/stem-artifact-host/artifacts').json()
+    assert {item['artifact_type'] for item in all_artifacts} == {'equation', 'constant', 'algorithm', 'experiment'}
+    assert len(client.get('/wiki/pages/stem-artifact-host/artifacts', params={'artifact_type': 'equation'}).json()) == 1
+
+def test_stem_artifact_validation_and_immutability(client):
+    client.post('/wiki/pages', json={
+        'slug': 'artifact-validation', 'title': 'Artifact validation',
+        'body': 'Validation test page.', 'discipline': 'mathematics'
+    })
+    invalid = client.post('/wiki/pages/artifact-validation/artifacts', json={
+        'artifact_type': 'equation', 'name': 'Incomplete equation', 'data': {'expression': 'x + y'}
+    })
+    assert invalid.status_code == 422
+    unsupported = client.post('/wiki/pages/artifact-validation/artifacts', json={
+        'artifact_type': 'poem', 'name': 'Unsupported', 'data': {}
+    })
+    assert unsupported.status_code == 422
+    client.post('/wiki/pages/artifact-validation/artifacts', json={
+        'artifact_type': 'constant', 'name': 'Example', 'data': {'value': 1, 'unit': 'm'}
+    })
+    with search_app.connection() as conn:
+        artifact_id = conn.execute('SELECT id FROM stem_artifacts').fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('UPDATE stem_artifacts SET name=? WHERE id=?', ('Mutated', artifact_id))
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('DELETE FROM stem_artifacts WHERE id=?', (artifact_id,))
