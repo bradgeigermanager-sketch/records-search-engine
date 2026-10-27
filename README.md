@@ -75,3 +75,7 @@ Submit only sources you are authorized to retrieve; respect site terms, robots p
 6. STEM validation reports — implemented in v0.8.0 (screening aid; not a proof of correctness)
 7. Versioned validation rules and limited compound-unit dimensional checks — implemented in v0.9.0
 8. PostgreSQL migration, archive connectors, language detection, timelines, and evidence-conflict views
+
+
+## GitHub repository ingestion
+`POST /github/ingest-repository` reads a bounded set of text files from one repository. `POST /github/ingest-owner` scans up to 20 owned repositories per request and up to 50 files per repository, excluding forks and archived repositories. Each indexed file stores repository, ref, path, Git blob SHA, and source URL in provenance. Re-ingesting unchanged content does not create a duplicate document version. Public repositories are supported without credentials; private repositories require a deployment-configured GitHub access token with permission to read them. Do not pass credentials in request JSON. This first iteration is manually triggered, not an unattended background crawler.
