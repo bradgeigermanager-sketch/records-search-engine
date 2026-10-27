@@ -814,3 +814,58 @@ def test_explorer_includes_stale_evidence_revalidation_controls(client):
     assert '/github/relationship-change-events' in response.text
     assert '/github/relationship-revalidations' in response.text
     assert 'no_longer_supported' in response.text
+
+
+def test_relationship_change_comparison_returns_exact_version_diff_and_context(client):
+    left_provenance = {'method': 'github_repository_ingestion', 'owner': 'diff-owner', 'repository': 'diff-contract', 'path': 'README.md', 'git_blob_sha': 'old'}
+    right_provenance = {'method': 'github_repository_ingestion', 'owner': 'diff-owner', 'repository': 'diff-impl', 'path': 'README.md', 'git_blob_sha': 'impl'}
+    left = search_app.save_document('https://github.com/diff-owner/diff-contract/blob/main/README.md',
+        'Contract README', 'Line one\nold contract line\nLine three', 200, 'text/plain', left_provenance)
+    right = search_app.save_document('https://github.com/diff-owner/diff-impl/blob/main/README.md',
+        'Implementation README', 'Implements old contract line', 200, 'text/plain', right_provenance)
+    accepted = client.post('/github/relationship-reviews', json={
+        'from_source_id': left['source_id'], 'to_source_id': right['source_id'],
+        'decision': 'accepted', 'predicate': 'implements', 'rationale': 'Initial review.'
+    })
+    assert accepted.status_code == 200
+    changed = search_app.save_document('https://github.com/diff-owner/diff-contract/blob/main/README.md',
+        'Contract README', 'Line one\nnew contract line\nLine three\nNew requirement', 200, 'text/plain',
+        {**left_provenance, 'git_blob_sha': 'new'})
+    assert changed['outcome'] == 'changed'
+    events = client.get('/github/relationship-change-events', params={'owner': 'diff-owner'}).json()
+    event = next(e for e in events if e['relationship_id'] == accepted.json()['resulting_relationship_id'])
+    response = client.get('/github/relationship-change-comparisons', params={'event_id': event['event_id']})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['previous_version_id'] == left['version_id']
+    assert payload['current_version_id'] == changed['version_id']
+    assert payload['stored_hashes_match_versions'] is True
+    assert payload['added_lines'] >= 2
+    assert payload['removed_lines'] >= 1
+    assert any('old contract line' in line for line in payload['diff_lines'])
+    assert any('new contract line' in line for line in payload['diff_lines'])
+    assert payload['other_endpoint_current_version']['version_id'] == right['version_id']
+    assert client.get('/github/relationship-change-comparisons', params={'event_id': 999999}).status_code == 404
+
+
+def test_relationship_change_comparison_bounds_diff_output(client):
+    left_provenance = {'method': 'github_repository_ingestion', 'owner': 'diff-owner', 'repository': 'diff-large-a', 'path': 'large.txt'}
+    right_provenance = {'method': 'github_repository_ingestion', 'owner': 'diff-owner', 'repository': 'diff-large-b', 'path': 'small.txt'}
+    old_body = '\n'.join('old line %s' % i for i in range(250))
+    new_body = '\n'.join('new line %s' % i for i in range(250))
+    left = search_app.save_document('https://github.com/diff-owner/diff-large-a/blob/main/large.txt',
+        'Large old', old_body, 200, 'text/plain', left_provenance)
+    right = search_app.save_document('https://github.com/diff-owner/diff-large-b/blob/main/small.txt',
+        'Small', 'related', 200, 'text/plain', right_provenance)
+    accepted = client.post('/github/relationship-reviews', json={
+        'from_source_id': left['source_id'], 'to_source_id': right['source_id'],
+        'decision': 'accepted', 'predicate': 'possibly_related_to', 'rationale': 'Initial review.'
+    }).json()
+    changed = search_app.save_document('https://github.com/diff-owner/diff-large-a/blob/main/large.txt',
+        'Large new', new_body, 200, 'text/plain', left_provenance)
+    event = next(e for e in client.get('/github/relationship-change-events', params={'owner': 'diff-owner'}).json() if e['relationship_id'] == accepted['resulting_relationship_id'])
+    response = client.get('/github/relationship-change-comparisons', params={'event_id': event['event_id'], 'max_diff_lines': 100})
+    assert response.status_code == 200
+    assert response.json()['diff_truncated'] is True
+    assert len(response.json()['diff_lines']) <= 100
+    assert response.json()['added_lines'] >= 250
