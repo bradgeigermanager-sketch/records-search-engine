@@ -19,6 +19,28 @@ app = FastAPI(title=APP_NAME, version="0.2.0", description="Provenance-preservin
 
 class IngestRequest(BaseModel):
     url: HttpUrl
+class EntityCreate(BaseModel):
+    canonical_name: str
+    entity_type: str
+    description: str = ""
+    aliases: list[str] = []
+    provenance: dict = {}
+
+class MetadataCreate(BaseModel):
+    key: str
+    value: object
+    provenance: dict = {}
+
+class RelationshipCreate(BaseModel):
+    subject_entity_id: int
+    predicate: str
+    object_entity_id: int | None = None
+    object_literal: object | None = None
+    source_id: int | None = None
+    evidence_version_id: int | None = None
+    confidence: float | None = None
+    provenance: dict = {}
+
 class SearchResult(BaseModel):
     document_id: int
     version_id: int
@@ -114,6 +136,49 @@ def init_db():
             CREATE TRIGGER IF NOT EXISTS document_versions_no_update BEFORE UPDATE ON document_versions BEGIN SELECT RAISE(ABORT,'document versions are immutable'); END;
             CREATE TRIGGER IF NOT EXISTS document_versions_no_delete BEFORE DELETE ON document_versions BEGIN SELECT RAISE(ABORT,'document versions are immutable'); END;
             """)
+        if 2 not in applied:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS entities (
+                id INTEGER PRIMARY KEY,
+                canonical_name TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                aliases_json TEXT NOT NULL DEFAULT '[]',
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(canonical_name);
+            CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
+            CREATE TABLE IF NOT EXISTS source_metadata (
+                id INTEGER PRIMARY KEY,
+                source_id INTEGER NOT NULL REFERENCES sources(id),
+                metadata_key TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                supersedes_id INTEGER REFERENCES source_metadata(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_metadata_source_key_time
+                ON source_metadata(source_id, metadata_key, created_at DESC, id DESC);
+            CREATE TABLE IF NOT EXISTS entity_relationships (
+                id INTEGER PRIMARY KEY,
+                subject_entity_id INTEGER NOT NULL REFERENCES entities(id),
+                predicate TEXT NOT NULL,
+                object_entity_id INTEGER REFERENCES entities(id),
+                object_literal_json TEXT,
+                source_id INTEGER REFERENCES sources(id),
+                evidence_version_id INTEGER REFERENCES document_versions(id),
+                confidence REAL,
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                CHECK ((object_entity_id IS NOT NULL AND object_literal_json IS NULL)
+                    OR (object_entity_id IS NULL AND object_literal_json IS NOT NULL)),
+                CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1))
+            );
+            CREATE INDEX IF NOT EXISTS idx_relationship_subject ON entity_relationships(subject_entity_id);
+            CREATE INDEX IF NOT EXISTS idx_relationship_object ON entity_relationships(object_entity_id);
+            """)
+            conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(2,?)", (utc_now(),))
 
 @app.on_event("startup")
 def startup():
@@ -219,6 +284,125 @@ def source_events(source_id:int,limit:int=Query(default=50,ge=1,le=200)):
         if not conn.execute("SELECT 1 FROM sources WHERE id=?",(source_id,)).fetchone(): raise HTTPException(status_code=404,detail="Source not found")
         rows=conn.execute("SELECT * FROM ingestion_events WHERE source_id=? ORDER BY occurred_at DESC LIMIT ?",(source_id,limit)).fetchall()
     return [dict(r)|{"details":json.loads(r["details_json"])} for r in rows]
+
+@app.post("/entities")
+def create_entity(request: EntityCreate):
+    name = request.canonical_name.strip()
+    kind = request.entity_type.strip()
+    if not name or not kind:
+        raise HTTPException(status_code=422, detail="canonical_name and entity_type must not be blank")
+    now = utc_now()
+    with connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO entities(canonical_name,entity_type,description,aliases_json,provenance_json,created_at) VALUES(?,?,?,?,?,?)",
+            (name, kind, request.description, json.dumps(request.aliases, ensure_ascii=False), json.dumps(request.provenance, ensure_ascii=False, sort_keys=True), now))
+        entity_id = cur.lastrowid
+    return {"entity_id": entity_id, "canonical_name": name, "entity_type": kind,
+            "description": request.description, "aliases": request.aliases,
+            "provenance": request.provenance, "created_at": now}
+
+@app.get("/entities")
+def list_entities(q: str | None = None, entity_type: str | None = None,
+                  limit: int = Query(default=50, ge=1, le=200)):
+    clauses, params = [], []
+    if q:
+        clauses.append("(canonical_name LIKE ? OR aliases_json LIKE ?)")
+        params.extend([f"%{q}%", f"%{q}%"])
+    if entity_type:
+        clauses.append("entity_type=?")
+        params.append(entity_type)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    params.append(limit)
+    with connection() as conn:
+        rows = conn.execute("SELECT * FROM entities" + where + " ORDER BY canonical_name LIMIT ?", params).fetchall()
+    return [{"entity_id": r["id"], "canonical_name": r["canonical_name"], "entity_type": r["entity_type"],
+             "description": r["description"], "aliases": json.loads(r["aliases_json"]),
+             "provenance": json.loads(r["provenance_json"]), "created_at": r["created_at"]} for r in rows]
+
+@app.get("/entities/{entity_id}")
+def get_entity(entity_id: int):
+    with connection() as conn:
+        row = conn.execute("SELECT * FROM entities WHERE id=?", (entity_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Entity not found")
+        rels = conn.execute("""SELECT r.*, e.canonical_name object_entity_name
+            FROM entity_relationships r LEFT JOIN entities e ON e.id=r.object_entity_id
+            WHERE r.subject_entity_id=? OR r.object_entity_id=? ORDER BY r.created_at, r.id""",
+            (entity_id, entity_id)).fetchall()
+    return {"entity_id": row["id"], "canonical_name": row["canonical_name"], "entity_type": row["entity_type"],
+            "description": row["description"], "aliases": json.loads(row["aliases_json"]),
+            "provenance": json.loads(row["provenance_json"]), "created_at": row["created_at"],
+            "relationships": [{"relationship_id": r["id"], "subject_entity_id": r["subject_entity_id"],
+                "predicate": r["predicate"], "object_entity_id": r["object_entity_id"],
+                "object_entity_name": r["object_entity_name"],
+                "object_literal": json.loads(r["object_literal_json"]) if r["object_literal_json"] is not None else None,
+                "source_id": r["source_id"], "evidence_version_id": r["evidence_version_id"],
+                "confidence": r["confidence"], "provenance": json.loads(r["provenance_json"]),
+                "created_at": r["created_at"]} for r in rels]}
+
+@app.post("/sources/{source_id}/metadata")
+def add_source_metadata(source_id: int, request: MetadataCreate):
+    key = request.key.strip()
+    if not key:
+        raise HTTPException(status_code=422, detail="Metadata key must not be blank")
+    now = utc_now()
+    with connection() as conn:
+        if not conn.execute("SELECT 1 FROM sources WHERE id=?", (source_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Source not found")
+        previous = conn.execute("SELECT id FROM source_metadata WHERE source_id=? AND metadata_key=? ORDER BY created_at DESC,id DESC LIMIT 1", (source_id, key)).fetchone()
+        cur = conn.execute("INSERT INTO source_metadata(source_id,metadata_key,value_json,provenance_json,created_at,supersedes_id) VALUES(?,?,?,?,?,?)",
+            (source_id, key, json.dumps(request.value, ensure_ascii=False, sort_keys=True),
+             json.dumps(request.provenance, ensure_ascii=False, sort_keys=True), now, previous["id"] if previous else None))
+        metadata_id = cur.lastrowid
+    return {"metadata_id": metadata_id, "source_id": source_id, "key": key, "value": request.value,
+            "supersedes_id": previous["id"] if previous else None, "provenance": request.provenance, "created_at": now}
+
+@app.get("/sources/{source_id}/metadata")
+def get_source_metadata(source_id: int, include_history: bool = False):
+    with connection() as conn:
+        if not conn.execute("SELECT 1 FROM sources WHERE id=?", (source_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Source not found")
+        rows = conn.execute("SELECT * FROM source_metadata WHERE source_id=? ORDER BY metadata_key,created_at DESC,id DESC", (source_id,)).fetchall()
+    latest_ids = {}
+    for r in rows:
+        latest_ids.setdefault(r["metadata_key"], r["id"])
+    return [{"metadata_id": r["id"], "source_id": r["source_id"], "key": r["metadata_key"],
+             "value": json.loads(r["value_json"]), "provenance": json.loads(r["provenance_json"]),
+             "created_at": r["created_at"], "supersedes_id": r["supersedes_id"],
+             "is_current": latest_ids[r["metadata_key"]] == r["id"]}
+            for r in rows if include_history or latest_ids[r["metadata_key"]] == r["id"]]
+
+@app.post("/relationships")
+def create_relationship(request: RelationshipCreate):
+    predicate = request.predicate.strip()
+    if not predicate:
+        raise HTTPException(status_code=422, detail="predicate must not be blank")
+    if (request.object_entity_id is None) == (request.object_literal is None):
+        raise HTTPException(status_code=422, detail="Provide exactly one of object_entity_id or object_literal")
+    if request.confidence is not None and not 0 <= request.confidence <= 1:
+        raise HTTPException(status_code=422, detail="confidence must be between 0 and 1")
+    now = utc_now()
+    with connection() as conn:
+        if not conn.execute("SELECT 1 FROM entities WHERE id=?", (request.subject_entity_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Subject entity not found")
+        if request.object_entity_id is not None and not conn.execute("SELECT 1 FROM entities WHERE id=?", (request.object_entity_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Object entity not found")
+        if request.source_id is not None and not conn.execute("SELECT 1 FROM sources WHERE id=?", (request.source_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Source not found")
+        if request.evidence_version_id is not None and not conn.execute("SELECT 1 FROM document_versions WHERE id=?", (request.evidence_version_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Evidence version not found")
+        cur = conn.execute("""INSERT INTO entity_relationships(subject_entity_id,predicate,object_entity_id,object_literal_json,
+            source_id,evidence_version_id,confidence,provenance_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (request.subject_entity_id, predicate, request.object_entity_id,
+             json.dumps(request.object_literal, ensure_ascii=False, sort_keys=True) if request.object_entity_id is None else None,
+             request.source_id, request.evidence_version_id, request.confidence,
+             json.dumps(request.provenance, ensure_ascii=False, sort_keys=True), now))
+        relationship_id = cur.lastrowid
+    return {"relationship_id": relationship_id, "subject_entity_id": request.subject_entity_id,
+            "predicate": predicate, "object_entity_id": request.object_entity_id,
+            "object_literal": request.object_literal, "source_id": request.source_id,
+            "evidence_version_id": request.evidence_version_id, "confidence": request.confidence,
+            "provenance": request.provenance, "created_at": now}
 
 @app.get("/",response_class=HTMLResponse)
 def home():
