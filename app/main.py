@@ -1,6 +1,6 @@
 """Records Search Engine — source registry and immutable content versions."""
 from __future__ import annotations
-import hashlib, ipaddress, json, os, socket, sqlite3
+import hashlib, ipaddress, json, math, os, socket, sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urldefrag, urlunparse
@@ -14,8 +14,8 @@ APP_NAME = "Records Search Engine"
 DB_PATH = os.getenv("SEARCH_DB_PATH", "search.db")
 MAX_BYTES = 2_000_000
 TIMEOUT_SECONDS = 12
-USER_AGENT = "RecordsSearchEngine/0.7 (+responsible research; contact site operator before bulk use)"
-app = FastAPI(title=APP_NAME, version="0.7.0", description="Provenance-preserving web-record search prototype")
+USER_AGENT = "RecordsSearchEngine/0.8 (+responsible research; contact site operator before bulk use)"
+app = FastAPI(title=APP_NAME, version="0.8.0", description="Provenance-preserving web-record search prototype")
 
 class IngestRequest(BaseModel):
     url: HttpUrl
@@ -292,6 +292,21 @@ def init_db():
             CREATE TRIGGER IF NOT EXISTS knowledge_edges_no_delete BEFORE DELETE ON knowledge_edges BEGIN SELECT RAISE(ABORT,'knowledge edges are immutable'); END;
             """)
             conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(5,?)", (utc_now(),))
+        if 6 not in applied:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS stem_validation_reports (
+                id INTEGER PRIMARY KEY,
+                artifact_id INTEGER NOT NULL REFERENCES stem_artifacts(id),
+                validator_version TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK(outcome IN ('pass','review','fail')),
+                findings_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_stem_validation_artifact ON stem_validation_reports(artifact_id,created_at DESC);
+            CREATE TRIGGER IF NOT EXISTS stem_validation_no_update BEFORE UPDATE ON stem_validation_reports BEGIN SELECT RAISE(ABORT,'validation reports are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS stem_validation_no_delete BEFORE DELETE ON stem_validation_reports BEGIN SELECT RAISE(ABORT,'validation reports are immutable'); END;
+            """)
+            conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(6,?)", (utc_now(),))
 
 @app.on_event("startup")
 def startup():
@@ -648,6 +663,113 @@ def list_knowledge_edges(subject_kind: str | None = None, subject_id: int | None
              "evidence_page_revision_id": r["evidence_page_revision_id"], "confidence": r["confidence"],
              "status": r["status"], "provenance": json.loads(r["provenance_json"]), "created_at": r["created_at"]}
             for r in rows]
+
+def _validate_stem_data(artifact_type: str, data: dict) -> dict:
+    errors, warnings, checks = [], [], []
+    if artifact_type == "equation":
+        expression = data.get("expression")
+        variables = data.get("variables")
+        if not isinstance(expression, str) or not expression.strip():
+            errors.append("Equation expression must be a non-empty string.")
+        if not isinstance(variables, list) or not variables:
+            errors.append("Equation should define at least one variable.")
+        else:
+            symbols = set()
+            for index, variable in enumerate(variables):
+                if not isinstance(variable, dict):
+                    errors.append(f"Variable at index {index} must be an object.")
+                    continue
+                symbol = variable.get("symbol")
+                if not isinstance(symbol, str) or not symbol.strip():
+                    errors.append(f"Variable at index {index} is missing a symbol.")
+                elif symbol in symbols:
+                    warnings.append(f"Variable symbol '{symbol}' is defined more than once.")
+                else:
+                    symbols.add(symbol)
+                if not isinstance(variable.get("unit"), str) or not variable.get("unit", "").strip():
+                    warnings.append(f"Variable '{symbol or index}' has no unit recorded.")
+                if not variable.get("meaning"):
+                    warnings.append(f"Variable '{symbol or index}' has no meaning/definition.")
+        if "lhs_unit" in data and "rhs_unit" in data:
+            lhs, rhs = data["lhs_unit"], data["rhs_unit"]
+            dimensions = {"m":"length","cm":"length","km":"length","s":"time","min":"time","kg":"mass","g":"mass","N":"force","J":"energy","W":"power","m/s":"speed","m/s^2":"acceleration"}
+            if lhs in dimensions and rhs in dimensions:
+                if dimensions[lhs] != dimensions[rhs]:
+                    errors.append(f"Declared equation side units are dimensionally incompatible: {lhs} vs {rhs}.")
+                else:
+                    checks.append(f"Declared side units share the same coarse dimension: {lhs} and {rhs}.")
+            else:
+                warnings.append("Dimensional comparison was skipped because one or both units are not in the limited built-in unit map.")
+        else:
+            warnings.append("No lhs_unit/rhs_unit pair supplied; equation dimensional consistency was not evaluated.")
+    elif artifact_type == "constant":
+        value, unit = data.get("value"), data.get("unit")
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            errors.append("Constant value must be numeric or a documented string.")
+        elif isinstance(value, (int, float)) and not math.isfinite(value):
+            errors.append("Numeric constant must be finite.")
+        elif isinstance(value, str):
+            try:
+                number = float(value)
+                if not math.isfinite(number):
+                    errors.append("Numeric constant must be finite.")
+            except ValueError:
+                warnings.append("Constant value is textual; verify whether it is a symbolic value or a measured number.")
+        if not isinstance(unit, str) or not unit.strip():
+            errors.append("Constant must include a non-empty unit or explicitly use 'dimensionless'.")
+        if not data.get("source") and not data.get("reference"):
+            warnings.append("No source/reference is attached to the constant.")
+        if "uncertainty" not in data:
+            warnings.append("Uncertainty or a note explaining why uncertainty is not applicable is not recorded.")
+    elif artifact_type == "algorithm":
+        if not isinstance(data.get("pseudocode"), str) or not data.get("pseudocode", "").strip():
+            errors.append("Algorithm pseudocode must be non-empty.")
+        for field in ("inputs", "outputs"):
+            if not isinstance(data.get(field), list) or not data[field]:
+                warnings.append(f"Algorithm {field} should be a non-empty list.")
+        if not data.get("preconditions"):
+            warnings.append("Algorithm preconditions are not recorded.")
+        if not data.get("complexity"):
+            warnings.append("Algorithm complexity or an explicit not-assessed note is not recorded.")
+    elif artifact_type == "experiment":
+        procedure = data.get("procedure")
+        if not isinstance(procedure, list) or not procedure or not all(isinstance(step, str) and step.strip() for step in procedure):
+            errors.append("Experiment procedure must be a non-empty list of non-empty steps.")
+        for field in ("independent_variables", "dependent_variables"):
+            if not isinstance(data.get(field), list) or not data[field]:
+                errors.append(f"Experiment {field} must be a non-empty list.")
+        for field, label in (("controls","control variables"),("replicates","replicate plan"),("uncertainty","measurement uncertainty"),("safety","safety considerations")):
+            if not data.get(field):
+                warnings.append(f"Experiment {label} are not recorded.")
+        if not data.get("analysis_method"):
+            warnings.append("Experiment analysis method is not recorded.")
+    else:
+        errors.append("Unsupported STEM artifact type.")
+    outcome = "fail" if errors else ("review" if warnings else "pass")
+    return {"outcome": outcome, "errors": errors, "warnings": warnings, "checks": checks,
+            "note": "Automated validation is a screening aid, not proof of scientific correctness."}
+
+@app.post("/wiki/artifacts/{artifact_id}/validate")
+def validate_stem_artifact(artifact_id: int):
+    with connection() as conn:
+        artifact = conn.execute("SELECT id,artifact_type,data_json FROM stem_artifacts WHERE id=?", (artifact_id,)).fetchone()
+        if not artifact:
+            raise HTTPException(status_code=404, detail="STEM artifact not found")
+        result = _validate_stem_data(artifact["artifact_type"], json.loads(artifact["data_json"]))
+        now = utc_now()
+        cur = conn.execute("""INSERT INTO stem_validation_reports(artifact_id,validator_version,outcome,findings_json,created_at)
+            VALUES(?,?,?,?,?)""", (artifact_id, "0.1", result["outcome"], json.dumps(result, ensure_ascii=False, sort_keys=True), now))
+    return {"report_id": cur.lastrowid, "artifact_id": artifact_id, "validator_version": "0.1",
+            **result, "created_at": now}
+
+@app.get("/wiki/artifacts/{artifact_id}/validation-reports")
+def list_stem_validation_reports(artifact_id: int, limit: int = Query(default=20, ge=1, le=100)):
+    with connection() as conn:
+        if not conn.execute("SELECT 1 FROM stem_artifacts WHERE id=?", (artifact_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="STEM artifact not found")
+        rows = conn.execute("SELECT * FROM stem_validation_reports WHERE artifact_id=? ORDER BY created_at DESC,id DESC LIMIT ?", (artifact_id, limit)).fetchall()
+    return [{"report_id": r["id"], "artifact_id": r["artifact_id"], "validator_version": r["validator_version"],
+             "outcome": r["outcome"], **json.loads(r["findings_json"]), "created_at": r["created_at"]} for r in rows]
 
 def _validate_stem_artifact(artifact_type: str, data: dict):
     required = {
