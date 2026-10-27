@@ -721,3 +721,87 @@ def test_unchanged_source_does_not_create_relationship_staleness_event(client):
         'Unchanged body.', 200, 'text/plain', provenance)
     assert same['outcome'] == 'unchanged'
     assert client.get('/github/relationship-change-events', params={'owner': 'example-owner'}).json() == []
+
+
+def test_relationship_revalidation_reaffirms_current_versions_and_supersedes_old_edge(client):
+    left_provenance = {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'reval-a', 'path': 'README.md', 'git_blob_sha': 'old-a'}
+    right_provenance = {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'reval-b', 'path': 'README.md', 'git_blob_sha': 'stable-b'}
+    left = search_app.save_document(
+        'https://github.com/example-owner/reval-a/blob/main/README.md', 'reval-a README',
+        'API contract v1.', 200, 'text/plain', left_provenance)
+    right = search_app.save_document(
+        'https://github.com/example-owner/reval-b/blob/main/README.md', 'reval-b README',
+        'Implementation of API contract v1.', 200, 'text/plain', right_provenance)
+    accepted = client.post('/github/relationship-reviews', json={
+        'from_source_id': left['source_id'], 'to_source_id': right['source_id'],
+        'decision': 'accepted', 'predicate': 'implements', 'reviewer': 'reviewer',
+        'rationale': 'Initial version comparison.'
+    })
+    assert accepted.status_code == 200
+    old_relationship_id = accepted.json()['resulting_relationship_id']
+    changed = search_app.save_document(
+        'https://github.com/example-owner/reval-a/blob/main/README.md', 'reval-a README',
+        'API contract v2 with a clarified signature.', 200, 'text/plain',
+        {**left_provenance, 'git_blob_sha': 'new-a'})
+    assert changed['outcome'] == 'changed'
+    events = client.get('/github/relationship-change-events', params={'owner': 'example-owner'}).json()
+    event = next(e for e in events if e['relationship_id'] == old_relationship_id)
+    response = client.post('/github/relationship-revalidations', json={
+        'event_id': event['event_id'], 'decision': 'reaffirmed', 'reviewer': 'second-reviewer',
+        'rationale': 'Compared the new contract and implementation; the relationship still holds.',
+        'evidence_snapshot': [{'checked_version_ids': [changed['version_id'], right['version_id']]}]
+    })
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['replacement_relationship_id'] is not None
+    history = client.get('/github/relationship-revalidations', params={'owner': 'example-owner'}).json()
+    assert len(history) == 1
+    assert history[0]['decision'] == 'reaffirmed'
+    assert history[0]['replacement_relationship_id'] == payload['replacement_relationship_id']
+    graph = client.get('/github/relationship-graph', params={'owner': 'example-owner'}).json()
+    edge_ids = {edge['id'] for edge in graph['edges']}
+    assert old_relationship_id not in edge_ids
+    assert payload['replacement_relationship_id'] in edge_ids
+    with search_app.connection() as conn:
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('UPDATE relationship_revalidations SET decision=? WHERE id=?', ('disputed', payload['revalidation_id']))
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('DELETE FROM relationship_revalidations WHERE id=?', (payload['revalidation_id'],))
+
+
+def test_relationship_revalidation_can_mark_edge_no_longer_supported(client):
+    left_provenance = {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'obsolete-a', 'path': 'README.md'}
+    right_provenance = {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'obsolete-b', 'path': 'README.md'}
+    left = search_app.save_document('https://github.com/example-owner/obsolete-a/blob/main/README.md', 'obsolete-a README', 'Old contract.', 200, 'text/plain', left_provenance)
+    right = search_app.save_document('https://github.com/example-owner/obsolete-b/blob/main/README.md', 'obsolete-b README', 'Old implementation.', 200, 'text/plain', right_provenance)
+    accepted = client.post('/github/relationship-reviews', json={
+        'from_source_id': left['source_id'], 'to_source_id': right['source_id'],
+        'decision': 'accepted', 'predicate': 'implements', 'rationale': 'Initially verified.'
+    }).json()
+    changed = search_app.save_document('https://github.com/example-owner/obsolete-a/blob/main/README.md', 'obsolete-a README', 'The contract was removed.', 200, 'text/plain', left_provenance)
+    assert changed['outcome'] == 'changed'
+    event = next(e for e in client.get('/github/relationship-change-events', params={'owner': 'example-owner'}).json() if e['relationship_id'] == accepted['resulting_relationship_id'])
+    response = client.post('/github/relationship-revalidations', json={
+        'event_id': event['event_id'], 'decision': 'no_longer_supported',
+        'reviewer': 'reviewer', 'rationale': 'The current contract no longer supports this link.'
+    })
+    assert response.status_code == 200
+    assert response.json()['replacement_relationship_id'] is None
+    graph = client.get('/github/relationship-graph', params={'owner': 'example-owner'}).json()
+    assert accepted['resulting_relationship_id'] not in {edge['id'] for edge in graph['edges']}
+
+
+def test_relationship_revalidation_rejects_duplicate_decision_for_same_event(client):
+    left_provenance = {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'duplicate-a', 'path': 'README.md'}
+    right_provenance = {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'duplicate-b', 'path': 'README.md'}
+    left = search_app.save_document('https://github.com/example-owner/duplicate-a/blob/main/README.md', 'duplicate-a README', 'A.', 200, 'text/plain', left_provenance)
+    right = search_app.save_document('https://github.com/example-owner/duplicate-b/blob/main/README.md', 'duplicate-b README', 'B.', 200, 'text/plain', right_provenance)
+    accepted = client.post('/github/relationship-reviews', json={
+        'from_source_id': left['source_id'], 'to_source_id': right['source_id'], 'decision': 'accepted',
+        'predicate': 'possibly_related_to', 'rationale': 'Initial acceptance.'
+    }).json()
+    changed = search_app.save_document('https://github.com/example-owner/duplicate-a/blob/main/README.md', 'duplicate-a README', 'A changed.', 200, 'text/plain', left_provenance)
+    event = next(e for e in client.get('/github/relationship-change-events', params={'owner': 'example-owner'}).json() if e['relationship_id'] == accepted['resulting_relationship_id'])
+    payload = {'event_id': event['event_id'], 'decision': 'disputed', 'rationale': 'Need further review.'}
+    assert client.post('/github/relationship-revalidations', json=payload).status_code == 200
+    assert client.post('/github/relationship-revalidations', json=payload).status_code == 409
