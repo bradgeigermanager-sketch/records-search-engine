@@ -154,3 +154,24 @@ Reaffirmed and revised decisions create a new supported relationship record with
 - Each change event can receive one revalidation decision. A later content change creates a new event and review opportunity.
 
 The reviewer should compare the changed source against the other endpoint's current content, and provide the actual version IDs examined in `evidence_snapshot`. Decisions are human assertions, not automatic conclusions inferred from change detection.
+
+## Search query controls
+
+Both `GET /search` and `GET /github/search` accept `mode` and `field` parameters. Matching uses SQLite FTS5; queries are treated as plain-text tokens rather than arbitrary FTS expressions.
+
+- `mode=all` (default): every term must match.
+- `mode=any`: at least one term must match.
+- `mode=phrase`: terms must occur as an adjacent phrase.
+- `mode=prefix`: every term is matched as a token prefix, useful for partial words.
+- `field=both` (default): search titles and body text.
+- `field=title` or `field=body`: restrict matching to that field.
+
+Examples:
+
+```bash
+curl 'http://127.0.0.1:8000/search?q=identity%20record&mode=any'
+curl 'http://127.0.0.1:8000/search?q=identity%20record&mode=phrase'
+curl 'http://127.0.0.1:8000/search?q=auth&mode=prefix&field=title'
+curl 'http://127.0.0.1:8000/github/search?q=dependency&mode=any&field=body'
+```
+
