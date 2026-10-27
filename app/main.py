@@ -616,6 +616,8 @@ def github_repository_files(owner: str, repository: str,
 def create_github_repository_relationship(request: RepositoryRelationshipCreate):
     """Record an explicit, provenance-linked relation between files in different repositories."""
     predicate = request.predicate.strip()
+    if request.from_source_id == request.to_source_id:
+        raise HTTPException(status_code=422, detail="Cross-repository relationships must connect two different file sources")
     if not predicate or len(predicate) > 200:
         raise HTTPException(status_code=422, detail="predicate must contain 1 to 200 characters")
     if request.status not in {"proposed", "supported", "disputed", "rejected"}:
