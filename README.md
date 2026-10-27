@@ -1,6 +1,6 @@
 # Records Search Engine
 
-A provenance-preserving search engine prototype. Milestone 3 adds typed entities, explicit relationships, and append-only structured metadata with provenance.
+A provenance-preserving search engine prototype. Milestone 4 adds current-value structured metadata filters to full-text search and document listing, building on typed entities and append-only metadata history.
 
 ## Features
 - FastAPI JSON API and browser UI
@@ -9,6 +9,7 @@ A provenance-preserving search engine prototype. Milestone 3 adds typed entities
 - Immutable document versions with content hashes, retrieval metadata, and extraction status
 - Changed content creates a new version; unchanged retrievals are logged without duplicate versions
 - SQLite FTS5 current-version search by default, with optional historical search
+- Search and document-list filters for current structured metadata keys and exact string values
 - Idempotent schema migration, including legacy v0.1 document migration
 - Typed entity registry and evidence-linked entity relationships with confidence and provenance
 - Append-only source metadata revisions with explicit supersession history
@@ -37,6 +38,8 @@ docker compose up --build
 curl -X POST http://127.0.0.1:8000/ingest -H 'Content-Type: application/json' -d '{"url":"https://example.org/"}'
 curl 'http://127.0.0.1:8000/search?q=example'
 curl 'http://127.0.0.1:8000/search?q=example&include_history=true'
+curl 'http://127.0.0.1:8000/search?q=archive&metadata_key=language&metadata_value=en'
+curl 'http://127.0.0.1:8000/documents?metadata_key=reviewed&metadata_value=yes'
 curl 'http://127.0.0.1:8000/sources'
 curl 'http://127.0.0.1:8000/documents?include_history=true'
 ```
@@ -47,6 +50,6 @@ Submit only sources you are authorized to retrieve; respect site terms, robots p
 ## Roadmap
 1. Source registry, immutable versions, and ingestion logs — implemented in v0.2.0
 2. Typed entity registry, relationships, and append-only metadata — implemented in v0.3.0
-3. PostgreSQL migration and structured metadata filters
-4. Archive connectors and respectful scheduled retrieval
+3. Structured metadata filters for search and document listing — implemented in v0.4.0
+4. PostgreSQL migration and archive connectors with respectful scheduled retrieval
 5. Language detection, synonyms, timelines, and evidence-conflict views
