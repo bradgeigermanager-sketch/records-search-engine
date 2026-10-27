@@ -14,8 +14,8 @@ APP_NAME = "Records Search Engine"
 DB_PATH = os.getenv("SEARCH_DB_PATH", "search.db")
 MAX_BYTES = 2_000_000
 TIMEOUT_SECONDS = 12
-USER_AGENT = "RecordsSearchEngine/0.6 (+responsible research; contact site operator before bulk use)"
-app = FastAPI(title=APP_NAME, version="0.6.0", description="Provenance-preserving web-record search prototype")
+USER_AGENT = "RecordsSearchEngine/0.7 (+responsible research; contact site operator before bulk use)"
+app = FastAPI(title=APP_NAME, version="0.7.0", description="Provenance-preserving web-record search prototype")
 
 class IngestRequest(BaseModel):
     url: HttpUrl
@@ -70,6 +70,17 @@ class STEMArtifactCreate(BaseModel):
     artifact_type: str
     name: str
     data: dict
+    provenance: dict = {}
+
+class KnowledgeEdgeCreate(BaseModel):
+    subject_kind: str
+    subject_id: int
+    predicate: str
+    object_kind: str
+    object_id: int
+    evidence_page_revision_id: int | None = None
+    confidence: float | None = None
+    status: str = "proposed"
     provenance: dict = {}
 
 class SearchResult(BaseModel):
@@ -260,6 +271,27 @@ def init_db():
             CREATE TRIGGER IF NOT EXISTS stem_artifacts_no_delete BEFORE DELETE ON stem_artifacts BEGIN SELECT RAISE(ABORT,'STEM artifacts are immutable'); END;
             """)
             conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(4,?)", (utc_now(),))
+        if 5 not in applied:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS knowledge_edges (
+                id INTEGER PRIMARY KEY,
+                subject_kind TEXT NOT NULL CHECK(subject_kind IN ('page','artifact')),
+                subject_id INTEGER NOT NULL,
+                predicate TEXT NOT NULL,
+                object_kind TEXT NOT NULL CHECK(object_kind IN ('page','artifact')),
+                object_id INTEGER NOT NULL,
+                evidence_page_revision_id INTEGER REFERENCES wiki_page_revisions(id),
+                confidence REAL CHECK(confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+                status TEXT NOT NULL DEFAULT 'proposed' CHECK(status IN ('proposed','supported','disputed','rejected')),
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_knowledge_edges_subject ON knowledge_edges(subject_kind,subject_id,predicate);
+            CREATE INDEX IF NOT EXISTS idx_knowledge_edges_object ON knowledge_edges(object_kind,object_id,predicate);
+            CREATE TRIGGER IF NOT EXISTS knowledge_edges_no_update BEFORE UPDATE ON knowledge_edges BEGIN SELECT RAISE(ABORT,'knowledge edges are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS knowledge_edges_no_delete BEFORE DELETE ON knowledge_edges BEGIN SELECT RAISE(ABORT,'knowledge edges are immutable'); END;
+            """)
+            conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(5,?)", (utc_now(),))
 
 @app.on_event("startup")
 def startup():
@@ -513,6 +545,66 @@ def create_relationship(request: RelationshipCreate):
             "object_literal": request.object_literal, "source_id": request.source_id,
             "evidence_version_id": request.evidence_version_id, "confidence": request.confidence,
             "provenance": request.provenance, "created_at": now}
+
+def _knowledge_node_exists(conn, kind, node_id):
+    if kind == "page":
+        return conn.execute("SELECT 1 FROM wiki_page_revisions WHERE id=?", (node_id,)).fetchone() is not None
+    if kind == "artifact":
+        return conn.execute("SELECT 1 FROM stem_artifacts WHERE id=?", (node_id,)).fetchone() is not None
+    return False
+
+@app.post("/wiki/edges")
+def create_knowledge_edge(request: KnowledgeEdgeCreate):
+    sk, ok = request.subject_kind.strip().lower(), request.object_kind.strip().lower()
+    predicate = request.predicate.strip().lower().replace(" ", "_")
+    if sk not in {"page", "artifact"} or ok not in {"page", "artifact"}:
+        raise HTTPException(status_code=422, detail="Node kinds must be page or artifact")
+    if not predicate or len(predicate) > 120:
+        raise HTTPException(status_code=422, detail="Predicate must contain 1-120 characters")
+    if request.status not in {"proposed", "supported", "disputed", "rejected"}:
+        raise HTTPException(status_code=422, detail="Invalid relationship status")
+    if request.confidence is not None and not 0 <= request.confidence <= 1:
+        raise HTTPException(status_code=422, detail="Confidence must be between 0 and 1")
+    with connection() as conn:
+        if not _knowledge_node_exists(conn, sk, request.subject_id) or not _knowledge_node_exists(conn, ok, request.object_id):
+            raise HTTPException(status_code=404, detail="Subject or object node not found")
+        evidence = request.evidence_page_revision_id
+        if evidence is not None and not conn.execute("SELECT 1 FROM wiki_page_revisions WHERE id=?", (evidence,)).fetchone():
+            raise HTTPException(status_code=404, detail="Evidence page revision not found")
+        now = utc_now()
+        cur = conn.execute("""INSERT INTO knowledge_edges
+            (subject_kind,subject_id,predicate,object_kind,object_id,evidence_page_revision_id,confidence,status,provenance_json,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (sk, request.subject_id, predicate, ok, request.object_id, evidence, request.confidence,
+             request.status, json.dumps(request.provenance, ensure_ascii=False, sort_keys=True), now))
+        edge_id = cur.lastrowid
+    return {"edge_id": edge_id, "subject_kind": sk, "subject_id": request.subject_id, "predicate": predicate,
+            "object_kind": ok, "object_id": request.object_id, "evidence_page_revision_id": evidence,
+            "confidence": request.confidence, "status": request.status, "provenance": request.provenance, "created_at": now}
+
+@app.get("/wiki/edges")
+def list_knowledge_edges(subject_kind: str | None = None, subject_id: int | None = None,
+                         object_kind: str | None = None, object_id: int | None = None,
+                         predicate: str | None = None, status: str | None = None,
+                         limit: int = Query(default=100, ge=1, le=500)):
+    clauses, params = [], []
+    for field, value in (("subject_kind", subject_kind), ("subject_id", subject_id),
+                         ("object_kind", object_kind), ("object_id", object_id),
+                         ("predicate", predicate), ("status", status)):
+        if value is not None:
+            clauses.append(field + "=?")
+            params.append(value.strip().lower().replace(" ", "_") if field == "predicate" else value)
+    if status is not None and status not in {"proposed", "supported", "disputed", "rejected"}:
+        raise HTTPException(status_code=422, detail="Invalid relationship status")
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    params.append(limit)
+    with connection() as conn:
+        rows = conn.execute("SELECT * FROM knowledge_edges" + where + " ORDER BY created_at DESC,id DESC LIMIT ?", params).fetchall()
+    return [{"edge_id": r["id"], "subject_kind": r["subject_kind"], "subject_id": r["subject_id"],
+             "predicate": r["predicate"], "object_kind": r["object_kind"], "object_id": r["object_id"],
+             "evidence_page_revision_id": r["evidence_page_revision_id"], "confidence": r["confidence"],
+             "status": r["status"], "provenance": json.loads(r["provenance_json"]), "created_at": r["created_at"]}
+            for r in rows]
 
 def _validate_stem_artifact(artifact_type: str, data: dict):
     required = {
