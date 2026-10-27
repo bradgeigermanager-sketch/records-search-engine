@@ -14,7 +14,7 @@ A provenance-preserving search engine with a versioned STEM Wiki, typed STEM art
 - Typed entity registry and evidence-linked entity relationships with confidence and provenance
 - Append-only source metadata revisions with explicit supersession history
 - STEM Wiki with immutable page revisions, full-text search, discipline/language filters, tags, references, and provenance
-- Structured immutable STEM artifacts for equations, constants, algorithms, and experiments
+- Structured immutable STEM artifacts for equations, constants, algorithms, and experiments, with a JSON editor in the page view
 - Automated tests, GitHub Actions CI, and Docker Compose deployment
 
 ## Run locally
