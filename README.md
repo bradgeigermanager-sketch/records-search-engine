@@ -1,6 +1,6 @@
 # Records Search Engine
 
-A provenance-preserving search engine with a versioned STEM Wiki, structured metadata filters, typed entities, and evidence-aware relationships.
+A provenance-preserving search engine with a versioned STEM Wiki, typed STEM artifacts, structured metadata filters, typed entities, and evidence-aware relationships.
 
 ## Features
 - FastAPI JSON API and browser UI
@@ -14,6 +14,7 @@ A provenance-preserving search engine with a versioned STEM Wiki, structured met
 - Typed entity registry and evidence-linked entity relationships with confidence and provenance
 - Append-only source metadata revisions with explicit supersession history
 - STEM Wiki with immutable page revisions, full-text search, discipline/language filters, tags, references, and provenance
+- Structured immutable STEM artifacts for equations, constants, algorithms, and experiments
 - Automated tests, GitHub Actions CI, and Docker Compose deployment
 
 ## Run locally
@@ -44,6 +45,8 @@ curl 'http://127.0.0.1:8000/documents?metadata_key=reviewed&metadata_value=yes'
 curl -X POST http://127.0.0.1:8000/wiki/pages -H 'Content-Type: application/json' -d '{"slug":"newton-second-law","title":"Newton Second Law","body":"Net force equals mass times acceleration. F = m a.","discipline":"physics","tags":["mechanics"]}'
 curl 'http://127.0.0.1:8000/wiki/search?q=force&discipline=physics'
 curl 'http://127.0.0.1:8000/wiki/pages/newton-second-law?include_history=true'
+curl -X POST http://127.0.0.1:8000/wiki/pages/newton-second-law/artifacts -H 'Content-Type: application/json' -d '{"artifact_type":"equation","name":"Newton second law","data":{"expression":"F = m * a","variables":[{"symbol":"F","meaning":"net force","unit":"N"},{"symbol":"m","meaning":"mass","unit":"kg"},{"symbol":"a","meaning":"acceleration","unit":"m/s^2"}]}}'
+curl 'http://127.0.0.1:8000/wiki/pages/newton-second-law/artifacts?artifact_type=equation'
 curl 'http://127.0.0.1:8000/sources'
 curl 'http://127.0.0.1:8000/documents?include_history=true'
 ```
@@ -56,4 +59,5 @@ Submit only sources you are authorized to retrieve; respect site terms, robots p
 2. Typed entity registry, relationships, and append-only metadata — implemented in v0.3.0
 3. Structured metadata filters for search and document listing — implemented in v0.4.0
 4. STEM Wiki — implemented in v0.5.0
-5. PostgreSQL migration, archive connectors, language detection, timelines, and evidence-conflict views
+5. Structured STEM artifacts — implemented in v0.6.0
+6. PostgreSQL migration, archive connectors, language detection, timelines, and evidence-conflict views
