@@ -603,3 +603,62 @@ def test_github_relationship_candidate_discovery_requires_owner_and_bounds(clien
     assert client.get('/github/relationship-candidates').status_code == 422
     assert client.get('/github/relationship-candidates', params={'owner': 'example-owner', 'max_sources': 501}).status_code == 422
     assert client.get('/github/relationship-candidates', params={'owner': '../bad'}).status_code == 422
+
+
+def test_relationship_review_acceptance_is_immutable_and_visible_in_graph(client):
+    first = search_app.save_document(
+        'https://github.com/example-owner/review-a/blob/main/README.md', 'review-a README',
+        'A source with a stable interface.', 200, 'text/plain',
+        {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'review-a', 'path': 'README.md'})
+    second = search_app.save_document(
+        'https://github.com/example-owner/review-b/blob/main/README.md', 'review-b README',
+        'A source implementing the stable interface.', 200, 'text/plain',
+        {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'review-b', 'path': 'README.md'})
+    review = client.post('/github/relationship-reviews', json={
+        'from_source_id': first['source_id'], 'to_source_id': second['source_id'],
+        'decision': 'accepted', 'predicate': 'implements', 'reviewer': 'test-reviewer',
+        'rationale': 'The documented interface and implementation match.',
+        'confidence': 0.9, 'evidence_snapshot': [{'type': 'manual_review', 'version_ids': [first['version_id'], second['version_id']]}],
+        'provenance': {'method': 'test'}
+    })
+    assert review.status_code == 200
+    payload = review.json()
+    assert payload['decision'] == 'accepted'
+    assert payload['resulting_relationship_id'] is not None
+    reviews = client.get('/github/relationship-reviews', params={'owner': 'example-owner', 'decision': 'accepted'}).json()
+    assert len(reviews) == 1
+    assert reviews[0]['reviewer'] == 'test-reviewer'
+    assert reviews[0]['evidence_snapshot'][0]['type'] == 'manual_review'
+    graph = client.get('/github/relationship-graph', params={'owner': 'example-owner'}).json()
+    assert graph['node_count'] == 2
+    assert any(edge['predicate'] == 'implements' and edge['status'] == 'supported' for edge in graph['edges'])
+    with search_app.connection() as conn:
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('UPDATE repository_relationship_reviews SET decision=? WHERE id=?', ('rejected', payload['review_id']))
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('DELETE FROM repository_relationship_reviews WHERE id=?', (payload['review_id'],))
+
+
+def test_relationship_review_rejection_does_not_create_graph_edge(client):
+    first = search_app.save_document(
+        'https://github.com/example-owner/reject-a/blob/main/README.md', 'reject-a README',
+        'Potential relation.', 200, 'text/plain',
+        {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'reject-a', 'path': 'README.md'})
+    second = search_app.save_document(
+        'https://github.com/example-owner/reject-b/blob/main/README.md', 'reject-b README',
+        'Potentially unrelated.', 200, 'text/plain',
+        {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'reject-b', 'path': 'README.md'})
+    response = client.post('/github/relationship-reviews', json={
+        'from_source_id': first['source_id'], 'to_source_id': second['source_id'],
+        'decision': 'rejected', 'reviewer': 'reviewer', 'rationale': 'Evidence insufficient.'
+    })
+    assert response.status_code == 200
+    assert response.json()['resulting_relationship_id'] is None
+    assert client.get('/github/repository-relationships', params={'owner': 'example-owner'}).json() == []
+    assert len(client.get('/github/relationship-reviews', params={'owner': 'example-owner', 'decision': 'rejected'}).json()) == 1
+
+
+def test_relationship_review_validation(client):
+    assert client.post('/github/relationship-reviews', json={
+        'from_source_id': 1, 'to_source_id': 2, 'decision': 'maybe'
+    }).status_code == 422
