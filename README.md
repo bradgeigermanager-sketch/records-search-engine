@@ -130,6 +130,8 @@ These events indicate that evidence may be stale; they do not establish that a r
 
 ## Relationship revalidation and resolution
 
+The browser explorer at `/github/explorer` also displays unresolved change events and provides controls to reaffirm, revise, dispute, or mark a relationship no longer supported. It includes the old/current version IDs and content hashes for review. Reviewers should open and compare the source files before submitting a decision; the UI's evidence snapshot is a record of the displayed version identifiers, not an automatic semantic diff.
+
 When a source-change event exists, a reviewer can record one immutable revalidation decision with `POST /github/relationship-revalidations`. The request includes `event_id`, `decision`, and a required `rationale`; it can also include reviewer, predicate, confidence, evidence snapshot, and provenance.
 
 Supported decisions:
