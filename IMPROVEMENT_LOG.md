@@ -61,3 +61,15 @@ Copy this section for each substantive action:
 - **Result:** `DONE` / `VERIFIED` / `BLOCKED` / other registry status
 - **Known limitations:**
 - **Next action:**
+
+
+### `LOG-2026-10-26-007` — Consolidate deduplication relationship taxonomy and define initial record schema
+- **Repository:** [Records-Deduplication-Suite](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite)
+- **Action:** Inspected the suite overview, Record Relationship Determination procedure, foundational DeduplicationRecordIR note, and distributed-node recording discussion. Added a draft relationship taxonomy, an initial `DeduplicationRecordIR` JSON Schema, and an example demonstrating independent observations of the same subject.
+- **Commits:**
+  - [Relationship taxonomy](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/commit/0f5ae4274f649c84bf96d138e648b58c76085588)
+  - [Independent-observations example](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/commit/0a219c96d36bb97fc65d4d5a6d68a76ebdc85649)
+  - [DeduplicationRecordIR schema](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/commit/815b1ccc09d192ecb00cadc12e0fd1f41cc2ed4a)
+- **Status:** `DONE`; schema was authored as JSON but has not yet been checked by an external JSON Schema validator, and the example has not yet been run as an automated test.
+- **Key finding:** The distributed-node discussion's initial claim that records about the same subject will generally be duplicates is too broad. Independent observations, copied records, transformed records, and aggregated records must be distinguished; a shared subject is not enough to merge.
+- **Next:** Validate the schema and fixture; check README paths; define the relationship-assessment schema and decision table; then update registry status based on verification evidence.
