@@ -898,3 +898,33 @@ def test_search_rejects_unknown_mode_or_field(client):
     assert client.get('/search', params={'q': 'archive', 'mode': 'wildcard'}).status_code == 422
     assert client.get('/search', params={'q': 'archive', 'field': 'metadata'}).status_code == 422
 
+
+def test_search_explains_matches_and_returns_relevance_score(client):
+    search_app.save_document('https://example.org/a', 'Identity Registry', 'Stores verified identity records.', 200, 'text/plain')
+    response = client.get('/search', params={'q': 'identity records'})
+    assert response.status_code == 200
+    result = response.json()[0]
+    assert result['matched_terms'] == ['identity', 'records']
+    assert any('title match' in reason for reason in result['match_reasons'])
+    assert any('body match' in reason for reason in result['match_reasons'])
+    assert 0 <= result['relevance_score'] <= 100
+
+def test_search_ranks_title_matches_ahead_of_body_only_matches(client):
+    search_app.save_document('https://example.org/body', 'General Notes', 'Identity is discussed in this body.', 200, 'text/plain')
+    search_app.save_document('https://example.org/title', 'Identity Register', 'A record catalogue.', 200, 'text/plain')
+    response = client.get('/search', params={'q': 'identity'})
+    assert response.status_code == 200
+    assert response.json()[0]['url'] == 'https://example.org/title'
+
+def test_github_search_includes_match_explanation(client):
+    search_app.save_document('https://github.com/example/project/blob/main/README.md', 'Identity README',
+        'Identity records and provenance.', 200, 'text/plain',
+        provenance={'method': 'github_repository_ingestion', 'owner': 'example', 'repository': 'project',
+                    'ref': 'main', 'path': 'README.md', 'repository_url': 'https://github.com/example/project'})
+    response = client.get('/github/search', params={'q': 'identity', 'owner': 'example'})
+    assert response.status_code == 200
+    result = response.json()[0]
+    assert 'identity' in result['matched_terms']
+    assert result['match_reasons']
+    assert result['relevance_score'] > 0
+
