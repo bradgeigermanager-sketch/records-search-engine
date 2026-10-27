@@ -928,3 +928,24 @@ def test_github_search_includes_match_explanation(client):
     assert result['match_reasons']
     assert result['relevance_score'] > 0
 
+
+def test_search_filters_by_exact_domain_and_content_type(client):
+    search_app.save_document('https://example.org/a', 'Identity text', 'identity record', 200, 'text/plain')
+    search_app.save_document('https://sub.example.org/b', 'Identity HTML', 'identity record', 200, 'text/html')
+    search_app.save_document('https://notexample.org/c', 'Identity JSON', 'identity record', 200, 'application/json')
+    response = client.get('/search', params={'q': 'identity', 'domain': 'example.org', 'content_type': 'text/plain'})
+    assert response.status_code == 200
+    assert [item['url'] for item in response.json()] == ['https://example.org/a']
+
+def test_search_filters_by_retrieval_date_bounds(client):
+    search_app.save_document('https://example.org/a', 'Dated record', 'identity record', 200, 'text/plain')
+    assert client.get('/search', params={'q': 'identity', 'retrieved_after': '2000-01-01'}).json()
+    assert client.get('/search', params={'q': 'identity', 'retrieved_before': '2000-01-01'}).json() == []
+
+def test_search_facet_filters_validate_inputs(client):
+    search_app.save_document('https://example.org/a', 'Identity record', 'identity record', 200, 'text/plain')
+    assert client.get('/search', params={'q': 'identity', 'domain': 'example.org/path'}).status_code == 422
+    assert client.get('/search', params={'q': 'identity', 'content_type': 'text/*/html'}).status_code == 422
+    assert client.get('/search', params={'q': 'identity', 'retrieved_after': 'not-a-date'}).status_code == 422
+    assert client.get('/search', params={'q': 'identity', 'retrieved_after': '2026-12-01', 'retrieved_before': '2026-01-01'}).status_code == 422
+
