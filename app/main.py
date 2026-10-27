@@ -14,8 +14,8 @@ APP_NAME = "Records Search Engine"
 DB_PATH = os.getenv("SEARCH_DB_PATH", "search.db")
 MAX_BYTES = 2_000_000
 TIMEOUT_SECONDS = 12
-USER_AGENT = "RecordsSearchEngine/0.4 (+responsible research; contact site operator before bulk use)"
-app = FastAPI(title=APP_NAME, version="0.4.0", description="Provenance-preserving web-record search prototype")
+USER_AGENT = "RecordsSearchEngine/0.5 (+responsible research; contact site operator before bulk use)"
+app = FastAPI(title=APP_NAME, version="0.5.0", description="Provenance-preserving web-record search prototype")
 
 class IngestRequest(BaseModel):
     url: HttpUrl
@@ -432,6 +432,132 @@ def create_relationship(request: RelationshipCreate):
             "object_literal": request.object_literal, "source_id": request.source_id,
             "evidence_version_id": request.evidence_version_id, "confidence": request.confidence,
             "provenance": request.provenance, "created_at": now}
+
+def _wiki_slug(value: str) -> str:
+    import re
+    slug = re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+    if not slug or len(slug) > 160:
+        raise HTTPException(status_code=422, detail="slug must contain 1-160 URL-safe characters")
+    return slug
+
+def _wiki_revision_dict(row):
+    return {
+        "revision_id": row["revision_id"], "page_id": row["page_id"],
+        "slug": row["slug"], "revision_number": row["revision_number"],
+        "title": row["title"], "summary": row["summary"], "body": row["body"],
+        "language": row["language"], "discipline": row["discipline"],
+        "tags": json.loads(row["tags_json"]), "references": json.loads(row["references_json"]),
+        "author": row["author"], "change_note": row["change_note"],
+        "provenance": json.loads(row["provenance_json"]), "created_at": row["created_at"],
+        "is_current": row["current_revision_id"] == row["revision_id"]
+    }
+
+def _insert_wiki_revision(conn, page_id, slug, revision_number, request):
+    title, body, discipline = request.title.strip(), request.body.strip(), request.discipline.strip()
+    if not title or not body or not discipline:
+        raise HTTPException(status_code=422, detail="title, body, and discipline must not be blank")
+    now = utc_now()
+    tags = [str(tag).strip() for tag in request.tags if str(tag).strip()]
+    cur = conn.execute("""INSERT INTO wiki_page_revisions
+        (page_id,revision_number,title,summary,body,language,discipline,tags_json,references_json,author,change_note,provenance_json,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (page_id, revision_number, title, request.summary.strip(), body,
+         request.language.strip() or "en", discipline,
+         json.dumps(tags, ensure_ascii=False), json.dumps(request.references, ensure_ascii=False, sort_keys=True),
+         request.author.strip(), request.change_note.strip(),
+         json.dumps(request.provenance, ensure_ascii=False, sort_keys=True), now))
+    revision_id = cur.lastrowid
+    conn.execute("INSERT INTO wiki_fts(rowid,slug,title,summary,body,tags) VALUES(?,?,?,?,?,?)",
+        (revision_id, slug, title, request.summary, body, " ".join(tags)))
+    conn.execute("UPDATE wiki_pages SET current_revision_id=?,updated_at=? WHERE id=?", (revision_id, now, page_id))
+    return revision_id
+
+@app.post("/wiki/pages")
+def create_wiki_page(request: WikiPageCreate):
+    slug, now = _wiki_slug(request.slug), utc_now()
+    with connection() as conn:
+        if conn.execute("SELECT 1 FROM wiki_pages WHERE slug=?", (slug,)).fetchone():
+            raise HTTPException(status_code=409, detail="Wiki slug already exists; append a revision instead")
+        page_id = conn.execute("INSERT INTO wiki_pages(slug,created_at,updated_at) VALUES(?,?,?)", (slug, now, now)).lastrowid
+        revision_id = _insert_wiki_revision(conn, page_id, slug, 1, request)
+        row = conn.execute("""SELECT r.id revision_id,r.page_id,p.slug,r.revision_number,r.title,r.summary,r.body,r.language,r.discipline,r.tags_json,r.references_json,r.author,r.change_note,r.provenance_json,r.created_at,p.current_revision_id
+            FROM wiki_page_revisions r JOIN wiki_pages p ON p.id=r.page_id WHERE r.id=?""", (revision_id,)).fetchone()
+    return _wiki_revision_dict(row)
+
+@app.get("/wiki/pages")
+def list_wiki_pages(q: str | None = None, discipline: str | None = None,
+                    language: str | None = None, tag: str | None = None,
+                    limit: int = Query(default=50, ge=1, le=200)):
+    clauses, params = [], []
+    if q:
+        terms = [term.replace('"', ' ').strip() for term in q.split() if term.strip()]
+        if terms:
+            match = " AND ".join('"' + term.replace('"', '') + '"' for term in terms)
+            clauses.append("p.current_revision_id IN (SELECT rowid FROM wiki_fts WHERE wiki_fts MATCH ?)")
+            params.append(match)
+    if discipline:
+        clauses.append("r.discipline=?"); params.append(discipline)
+    if language:
+        clauses.append("r.language=?"); params.append(language)
+    if tag:
+        clauses.append("EXISTS (SELECT 1 FROM json_each(r.tags_json) WHERE value=?)"); params.append(tag)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    params.append(limit)
+    with connection() as conn:
+        rows = conn.execute("""SELECT r.id revision_id,r.page_id,p.slug,r.revision_number,r.title,r.summary,r.body,r.language,r.discipline,r.tags_json,r.references_json,r.author,r.change_note,r.provenance_json,r.created_at,p.current_revision_id
+            FROM wiki_pages p JOIN wiki_page_revisions r ON r.id=p.current_revision_id""" + where + " ORDER BY p.updated_at DESC LIMIT ?", params).fetchall()
+    return [_wiki_revision_dict(row) for row in rows]
+
+@app.get("/wiki/pages/{slug}")
+def get_wiki_page(slug: str, include_history: bool = False):
+    slug = _wiki_slug(slug)
+    with connection() as conn:
+        page = conn.execute("SELECT id,slug,current_revision_id FROM wiki_pages WHERE slug=?", (slug,)).fetchone()
+        if not page:
+            raise HTTPException(status_code=404, detail="Wiki page not found")
+        if include_history:
+            rows = conn.execute("""SELECT r.id revision_id,r.page_id,p.slug,r.revision_number,r.title,r.summary,r.body,r.language,r.discipline,r.tags_json,r.references_json,r.author,r.change_note,r.provenance_json,r.created_at,p.current_revision_id
+                FROM wiki_page_revisions r JOIN wiki_pages p ON p.id=r.page_id WHERE p.id=? ORDER BY r.revision_number DESC""", (page["id"],)).fetchall()
+        else:
+            rows = conn.execute("""SELECT r.id revision_id,r.page_id,p.slug,r.revision_number,r.title,r.summary,r.body,r.language,r.discipline,r.tags_json,r.references_json,r.author,r.change_note,r.provenance_json,r.created_at,p.current_revision_id
+                FROM wiki_page_revisions r JOIN wiki_pages p ON p.id=r.page_id WHERE r.id=?""", (page["current_revision_id"],)).fetchall()
+    values = [_wiki_revision_dict(row) for row in rows]
+    return {"slug": slug, "current_revision_id": page["current_revision_id"], "revisions": values} if include_history else values[0]
+
+@app.post("/wiki/pages/{slug}/revisions")
+def add_wiki_revision(slug: str, request: WikiRevisionCreate):
+    slug = _wiki_slug(slug)
+    with connection() as conn:
+        page = conn.execute("SELECT id FROM wiki_pages WHERE slug=?", (slug,)).fetchone()
+        if not page:
+            raise HTTPException(status_code=404, detail="Wiki page not found")
+        number = conn.execute("SELECT COALESCE(MAX(revision_number),0)+1 FROM wiki_page_revisions WHERE page_id=?", (page["id"],)).fetchone()[0]
+        revision_id = _insert_wiki_revision(conn, page["id"], slug, number, request)
+        row = conn.execute("""SELECT r.id revision_id,r.page_id,p.slug,r.revision_number,r.title,r.summary,r.body,r.language,r.discipline,r.tags_json,r.references_json,r.author,r.change_note,r.provenance_json,r.created_at,p.current_revision_id
+            FROM wiki_page_revisions r JOIN wiki_pages p ON p.id=r.page_id WHERE r.id=?""", (revision_id,)).fetchone()
+    return _wiki_revision_dict(row)
+
+@app.get("/wiki/search")
+def search_wiki(q: str = Query(min_length=1, max_length=300),
+                discipline: str | None = None, language: str | None = None,
+                include_history: bool = False, limit: int = Query(default=20, ge=1, le=100)):
+    terms = [term.replace('"', ' ').strip() for term in q.split() if term.strip()]
+    if not terms:
+        return []
+    match = " AND ".join('"' + term.replace('"', '') + '"' for term in terms)
+    clauses, params = ["wiki_fts MATCH ?"], [match]
+    if not include_history:
+        clauses.append("p.current_revision_id=r.id")
+    if discipline:
+        clauses.append("r.discipline=?"); params.append(discipline)
+    if language:
+        clauses.append("r.language=?"); params.append(language)
+    params.append(limit)
+    with connection() as conn:
+        rows = conn.execute("""SELECT r.id revision_id,r.page_id,p.slug,r.revision_number,r.title,r.summary,r.body,r.language,r.discipline,r.tags_json,r.references_json,r.author,r.change_note,r.provenance_json,r.created_at,p.current_revision_id
+            FROM wiki_fts JOIN wiki_page_revisions r ON r.id=wiki_fts.rowid JOIN wiki_pages p ON p.id=r.page_id
+            WHERE """ + " AND ".join(clauses) + " ORDER BY bm25(wiki_fts),r.created_at DESC LIMIT ?", params).fetchall()
+    return [_wiki_revision_dict(row) for row in rows]
 
 @app.get("/",response_class=HTMLResponse)
 def home():
