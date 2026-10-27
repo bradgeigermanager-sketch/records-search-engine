@@ -104,3 +104,12 @@ Copy this section for each substantive action:
 - **Verification:** [Run 40453548665](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453548665) passed the Draft 2020-12 schema checks and valid assessment fixture. [Run 40453561754](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453561754) includes the new negative check and is pending final confirmation.
 - **Result:** The initial failure was useful: it demonstrated that the CI job fails on malformed schema JSON rather than silently accepting it. Do not mark the negative regression as verified until its run completes successfully.
 - **Next:** Confirm the latest run, add more invalid cases for missing required fields and out-of-range confidence, then reconcile the procedural decision table with the machine vocabulary.
+
+
+### `LOG-2026-10-26-011` — Draft relationship-to-action decision table
+- **Repository:** [Records-Deduplication-Suite](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite)
+- **Action:** Added [relationship decision table v1](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/blob/main/docs/relationship-decision-table-v1.md), aligning the relationship taxonomy with conservative eligibility/action defaults. The table explicitly distinguishes shared subject/event, independent observation, corroboration, conflicts, lineage, versions, corrections, and actual duplicate candidates.
+- **Commit:** [6b722cd](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/commit/6b722cdd65ec93bd01462779e10b1bd708f51432)
+- **Verification:** Earlier schema/fixture run [40453548665](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453548665) passed; first negative test run [40453561754](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453561754) passed. Expanded regression run [40453597735](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453597735) was observed as `completed` with conclusion `success` when logged.
+- **Limit:** The table is a policy draft; it is not yet fully enforced by code or schema, and no merge execution engine exists in this repository.
+- **Next:** Confirm expanded CI outcome; reconcile the procedure's terminology and output fields with the schema; add positive/negative fixtures and check links.
