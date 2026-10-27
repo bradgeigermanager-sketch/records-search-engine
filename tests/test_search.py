@@ -871,3 +871,30 @@ def test_relationship_change_comparison_bounds_diff_output(client):
     assert response.json()['diff_truncated'] is True
     assert len(response.json()['diff_lines']) <= 100
     assert response.json()['added_lines'] >= 250
+
+def test_search_any_mode_returns_documents_matching_either_term(client):
+    search_app.save_document('https://example.org/a', 'Orchard notes', 'apples grow here', 200, 'text/plain')
+    search_app.save_document('https://example.org/b', 'River notes', 'water flows here', 200, 'text/plain')
+    response = client.get('/search', params={'q': 'apples water', 'mode': 'any'})
+    assert response.status_code == 200
+    assert {item['url'] for item in response.json()} == {'https://example.org/a', 'https://example.org/b'}
+
+def test_search_phrase_mode_requires_adjacent_phrase(client):
+    search_app.save_document('https://example.org/a', 'Phrase', 'records search engine', 200, 'text/plain')
+    search_app.save_document('https://example.org/b', 'Separate', 'records are searchable; engine is separate', 200, 'text/plain')
+    response = client.get('/search', params={'q': 'records search', 'mode': 'phrase'})
+    assert response.status_code == 200
+    assert [item['url'] for item in response.json()] == ['https://example.org/a']
+
+def test_search_field_title_and_prefix_modes(client):
+    search_app.save_document('https://example.org/a', 'Provenance Registry', 'unrelated text', 200, 'text/plain')
+    search_app.save_document('https://example.org/b', 'Other title', 'provenance registry details', 200, 'text/plain')
+    title_only = client.get('/search', params={'q': 'provenance', 'field': 'title'})
+    assert [item['url'] for item in title_only.json()] == ['https://example.org/a']
+    prefix = client.get('/search', params={'q': 'prove', 'mode': 'prefix'})
+    assert {item['url'] for item in prefix.json()} == {'https://example.org/a', 'https://example.org/b'}
+
+def test_search_rejects_unknown_mode_or_field(client):
+    assert client.get('/search', params={'q': 'archive', 'mode': 'wildcard'}).status_code == 422
+    assert client.get('/search', params={'q': 'archive', 'field': 'metadata'}).status_code == 422
+
