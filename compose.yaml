@@ -1,0 +1,12 @@
+services:
+  search:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      SEARCH_DB_PATH: /data/search.db
+    volumes:
+      - search-data:/data
+    restart: unless-stopped
+volumes:
+  search-data:
