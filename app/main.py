@@ -15,7 +15,7 @@ DB_PATH = os.getenv("SEARCH_DB_PATH", "search.db")
 MAX_BYTES = 2_000_000
 TIMEOUT_SECONDS = 12
 USER_AGENT = "RecordsSearchEngine/0.11 (+responsible research; contact site operator before bulk use)"
-app = FastAPI(title=APP_NAME, version="0.13.0", description="Provenance-preserving web-record search prototype")
+app = FastAPI(title=APP_NAME, version="0.14.0", description="Provenance-preserving web-record search prototype")
 
 class IngestRequest(BaseModel):
     url: HttpUrl
@@ -51,6 +51,17 @@ class RelationshipCreate(BaseModel):
     source_id: int | None = None
     evidence_version_id: int | None = None
     confidence: float | None = None
+    provenance: dict = {}
+
+class RepositoryRelationshipReviewCreate(BaseModel):
+    from_source_id: int
+    to_source_id: int
+    decision: str
+    predicate: str = "possibly_related_to"
+    reviewer: str = "unspecified"
+    rationale: str = ""
+    confidence: float | None = None
+    evidence_snapshot: list[dict] = []
     provenance: dict = {}
 
 class RepositoryRelationshipCreate(BaseModel):
@@ -339,6 +350,30 @@ def init_db():
             conn.execute("""INSERT OR IGNORE INTO stem_validation_rule_sets(name,version,rules_json,created_at) VALUES(?,?,?,?)""",
                 ("stem-core","0.2",json.dumps({"equation":["expression_required","variables_defined","coarse_dimensional_check"],"constant":["value_finite","unit_required","source_review","uncertainty_review"],"algorithm":["pseudocode_required","interface_review","preconditions_review","complexity_review"],"experiment":["procedure_complete","variables_defined","controls_review","replication_review","uncertainty_review","safety_review"]}, sort_keys=True),utc_now()))
             conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(7,?)", (utc_now(),))
+
+        if 9 not in applied:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS repository_relationship_reviews (
+                id INTEGER PRIMARY KEY,
+                from_source_id INTEGER NOT NULL REFERENCES sources(id),
+                to_source_id INTEGER NOT NULL REFERENCES sources(id),
+                decision TEXT NOT NULL CHECK(decision IN ('accepted','rejected','disputed')),
+                predicate TEXT NOT NULL,
+                reviewer TEXT NOT NULL,
+                rationale TEXT NOT NULL DEFAULT '',
+                confidence REAL CHECK(confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+                evidence_snapshot_json TEXT NOT NULL DEFAULT '[]',
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                resulting_relationship_id INTEGER REFERENCES repository_relationships(id),
+                created_at TEXT NOT NULL,
+                CHECK(from_source_id <> to_source_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_repo_reviews_pair ON repository_relationship_reviews(from_source_id,to_source_id,created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_repo_reviews_decision ON repository_relationship_reviews(decision,created_at DESC);
+            CREATE TRIGGER IF NOT EXISTS repository_relationship_reviews_no_update BEFORE UPDATE ON repository_relationship_reviews BEGIN SELECT RAISE(ABORT,'relationship reviews are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS repository_relationship_reviews_no_delete BEFORE DELETE ON repository_relationship_reviews BEGIN SELECT RAISE(ABORT,'relationship reviews are immutable'); END;
+            """)
+            conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(9,?)", (utc_now(),))
 
         if 8 not in applied:
             conn.executescript("""
@@ -715,6 +750,135 @@ def github_relationship_candidates(
             "scan_truncated": total > len(documents), "candidate_count_returned": len(results),
             "min_score": min_score, "candidates": results,
             "note": "Heuristic candidates are not verified facts and are not saved as relationships. Review evidence and create an explicit relationship only when justified."}
+
+
+
+@app.post("/github/relationship-reviews")
+def review_github_relationship_candidate(request: RepositoryRelationshipReviewCreate):
+    """Append an immutable review decision; accepted candidates create a supported edge."""
+    decision = request.decision.strip().lower()
+    predicate = request.predicate.strip()
+    reviewer = request.reviewer.strip()[:200]
+    rationale = request.rationale.strip()[:5000]
+    if decision not in {"accepted", "rejected", "disputed"}:
+        raise HTTPException(status_code=422, detail="decision must be accepted, rejected, or disputed")
+    if request.from_source_id == request.to_source_id:
+        raise HTTPException(status_code=422, detail="A review must connect two different file sources")
+    if not predicate or len(predicate) > 200:
+        raise HTTPException(status_code=422, detail="predicate must contain 1 to 200 characters")
+    if request.confidence is not None and not 0 <= request.confidence <= 1:
+        raise HTTPException(status_code=422, detail="confidence must be between 0 and 1")
+    now = utc_now()
+    with connection() as conn:
+        rows = conn.execute("""SELECT id,canonical_url,provenance_json FROM sources WHERE id IN (?,?)""",
+                            (request.from_source_id, request.to_source_id)).fetchall()
+        if len(rows) != 2:
+            raise HTTPException(status_code=404, detail="Both source IDs must exist and be different")
+        by_id = {r["id"]: r for r in rows}
+        left, right = by_id[request.from_source_id], by_id[request.to_source_id]
+        left_meta, right_meta = json.loads(left["provenance_json"] or "{}"), json.loads(right["provenance_json"] or "{}")
+        if left_meta.get("method") != "github_repository_ingestion" or right_meta.get("method") != "github_repository_ingestion":
+            raise HTTPException(status_code=422, detail="Both sources must be indexed GitHub repository files")
+        if (left_meta.get("owner", "").lower(), left_meta.get("repository", "").lower()) == (right_meta.get("owner", "").lower(), right_meta.get("repository", "").lower()):
+            raise HTTPException(status_code=422, detail="Relationship reviews must connect different repositories")
+        relationship_id = None
+        if decision == "accepted":
+            relation_provenance = {
+                "review_id": None, "reviewer": reviewer, "rationale": rationale,
+                "evidence_snapshot": request.evidence_snapshot,
+                "review_provenance": request.provenance,
+                "source_versions": {"from": None, "to": None},
+            }
+            # Capture current version identifiers so later updates cannot obscure what was reviewed.
+            current = conn.execute("SELECT id,current_version_id FROM sources WHERE id IN (?,?)",
+                                   (request.from_source_id, request.to_source_id)).fetchall()
+            current_by_id = {r["id"]: r["current_version_id"] for r in current}
+            relation_provenance["source_versions"] = {
+                "from": current_by_id.get(request.from_source_id), "to": current_by_id.get(request.to_source_id)}
+            cur = conn.execute("""INSERT INTO repository_relationships(from_source_id,to_source_id,predicate,confidence,status,provenance_json,created_at)
+                VALUES(?,?,?,?,?,?,?)""", (request.from_source_id, request.to_source_id, predicate,
+                request.confidence, "supported", json.dumps(relation_provenance, ensure_ascii=False, sort_keys=True), now))
+            relationship_id = cur.lastrowid
+        cur = conn.execute("""INSERT INTO repository_relationship_reviews
+            (from_source_id,to_source_id,decision,predicate,reviewer,rationale,confidence,evidence_snapshot_json,provenance_json,resulting_relationship_id,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (request.from_source_id, request.to_source_id, decision, predicate,
+            reviewer, rationale, request.confidence, json.dumps(request.evidence_snapshot, ensure_ascii=False, sort_keys=True),
+            json.dumps(request.provenance, ensure_ascii=False, sort_keys=True), relationship_id, now))
+        review_id = cur.lastrowid
+        if relationship_id is not None:
+            conn.execute("UPDATE repository_relationships SET provenance_json=? WHERE id=?", ("{}", relationship_id)) if False else None
+            # Relationships are immutable; review_id is therefore included in the edge provenance on a follow-up schema.
+    return {"review_id": review_id, "decision": decision, "from_source_id": request.from_source_id,
+            "to_source_id": request.to_source_id, "predicate": predicate, "reviewer": reviewer,
+            "rationale": rationale, "confidence": request.confidence, "resulting_relationship_id": relationship_id,
+            "created_at": now}
+
+
+@app.get("/github/relationship-reviews")
+def list_github_relationship_reviews(owner: str | None = None, decision: str | None = None,
+                                     limit: int = Query(default=100, ge=1, le=500)):
+    clauses = ["1=1"]
+    params = []
+    if owner:
+        clauses.append("(lower(json_extract(fs.provenance_json,'$.owner'))=lower(?) OR lower(json_extract(ts.provenance_json,'$.owner'))=lower(?))")
+        params.extend([owner.strip(), owner.strip()])
+    if decision:
+        if decision not in {"accepted", "rejected", "disputed"}:
+            raise HTTPException(status_code=422, detail="decision must be accepted, rejected, or disputed")
+        clauses.append("rr.decision=?")
+        params.append(decision)
+    params.append(limit)
+    with connection() as conn:
+        rows = conn.execute("""SELECT rr.*,fs.canonical_url from_url,ts.canonical_url to_url,
+            fs.provenance_json from_provenance_json,ts.provenance_json to_provenance_json
+            FROM repository_relationship_reviews rr JOIN sources fs ON fs.id=rr.from_source_id
+            JOIN sources ts ON ts.id=rr.to_source_id WHERE """ + " AND ".join(clauses) +
+            " ORDER BY rr.created_at DESC,rr.id DESC LIMIT ?", params).fetchall()
+    return [{"review_id": r["id"], "from_source_id": r["from_source_id"], "to_source_id": r["to_source_id"],
+             "from_url": r["from_url"], "to_url": r["to_url"],
+             "from_provenance": json.loads(r["from_provenance_json"]), "to_provenance": json.loads(r["to_provenance_json"]),
+             "decision": r["decision"], "predicate": r["predicate"], "reviewer": r["reviewer"],
+             "rationale": r["rationale"], "confidence": r["confidence"],
+             "evidence_snapshot": json.loads(r["evidence_snapshot_json"]),
+             "provenance": json.loads(r["provenance_json"]),
+             "resulting_relationship_id": r["resulting_relationship_id"], "created_at": r["created_at"]} for r in rows]
+
+
+@app.get("/github/relationship-graph")
+def github_relationship_graph(owner: str = Query(min_length=1, max_length=100),
+                              include_proposed: bool = False,
+                              limit: int = Query(default=500, ge=1, le=2000)):
+    """Return a graph payload with source nodes and explicit relationship edges."""
+    owner = owner.strip()
+    if not owner or any(c.isspace() for c in owner) or "/" in owner:
+        raise HTTPException(status_code=422, detail="owner must be a GitHub owner name")
+    with connection() as conn:
+        sources = conn.execute("""SELECT s.id,s.canonical_url,s.provenance_json,v.id version_id,v.title,
+            json_extract(v.provenance_json,'$.path') path
+            FROM sources s LEFT JOIN document_versions v ON v.id=s.current_version_id
+            WHERE lower(json_extract(s.provenance_json,'$.method'))='github_repository_ingestion'
+              AND lower(json_extract(s.provenance_json,'$.owner'))=lower(?)
+            ORDER BY s.id LIMIT ?""", (owner, limit)).fetchall()
+        statuses = ("supported", "proposed", "disputed") if include_proposed else ("supported",)
+        placeholders = ",".join("?" for _ in statuses)
+        edge_rows = conn.execute("""SELECT rr.*,fs.provenance_json from_meta,ts.provenance_json to_meta
+            FROM repository_relationships rr JOIN sources fs ON fs.id=rr.from_source_id
+            JOIN sources ts ON ts.id=rr.to_source_id
+            WHERE lower(json_extract(fs.provenance_json,'$.owner'))=lower(?)
+              AND lower(json_extract(ts.provenance_json,'$.owner'))=lower(?)
+              AND rr.status IN (""" + placeholders + ") ORDER BY rr.id LIMIT ?",
+              (owner, owner, *statuses, limit)).fetchall()
+    nodes = [{"id": r["id"], "label": r["title"] or r["path"] or r["canonical_url"],
+              "repository": json.loads(r["provenance_json"] or "{}").get("repository"),
+              "path": r["path"], "url": r["canonical_url"], "version_id": r["version_id"],
+              "source_navigation": f"/sources/{r['id']}", "history_navigation": f"/sources/{r['id']}/versions"} for r in sources]
+    edges = [{"id": r["id"], "source": r["from_source_id"], "target": r["to_source_id"],
+              "predicate": r["predicate"], "status": r["status"], "confidence": r["confidence"],
+              "provenance": json.loads(r["provenance_json"] or "{}"), "created_at": r["created_at"]}
+             for r in edge_rows]
+    return {"owner": owner, "nodes": nodes, "edges": edges, "node_count": len(nodes), "edge_count": len(edges),
+            "edge_filter": list(statuses), "nodes_truncated": len(nodes) >= limit,
+            "note": "Only explicit stored relationships are rendered as edges; heuristic candidates are not graph edges."}
 
 
 @app.post("/github/repository-relationships")
