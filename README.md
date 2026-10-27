@@ -5,6 +5,7 @@ A provenance-preserving search engine with a versioned STEM Wiki, typed STEM art
 ## Features
 - FastAPI JSON API and browser UI
 - HTTP/HTTPS HTML ingestion with a 2 MB response limit
+- GitHub repository text ingestion for public repositories or private repositories accessible to a configured `GITHUB_TOKEN`, preserving repository/ref/path/blob provenance
 - Stable source registry and provenance
 - Immutable document versions with content hashes, retrieval metadata, and extraction status
 - Changed content creates a new version; unchanged retrievals are logged without duplicate versions
@@ -58,6 +59,9 @@ curl 'http://127.0.0.1:8000/wiki/artifacts/1/validation-reports'
 curl 'http://127.0.0.1:8000/sources'
 curl 'http://127.0.0.1:8000/documents?include_history=true'
 ```
+
+## GitHub repository ingestion
+`POST /github/ingest-repository` reads a bounded set of text files from a repository tree. By default it includes Markdown, plain text, source code, JSON/YAML, SQL, HTML/XML, TOML, and CSV files; binary files, unsupported extensions, common dependency/build directories, and files over 2 MB are skipped. `max_files` is limited to 100 per request. Each indexed file is stored through the existing immutable document-version pipeline, with repository, ref, path, Git blob SHA, and source URL in provenance. Re-ingesting unchanged content does not create a duplicate document version. Set `GITHUB_TOKEN` in the deployment environment to access private repositories allowed by that token; never send the token in request JSON. This first iteration is manually triggered, not an unattended full-account crawler.
 
 ## Safety and scope
 Submit only sources you are authorized to retrieve; respect site terms, robots policies, rate limits, and copyright. The prototype blocks redirects, limits downloads, and only extracts HTML, but these controls do not eliminate all DNS-rebinding or network-level risks. Deploy behind egress controls for untrusted users. This is not a general crawler and does not bypass authentication or paywalls. Before public multi-user deployment, add authentication, rate limiting, stricter egress controls, and operational monitoring.
