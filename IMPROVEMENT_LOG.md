@@ -81,3 +81,17 @@ Copy this section for each substantive action:
 - **Evidence:** [Schema](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/blob/main/schemas/deduplication-record-ir.schema.json) and [example](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/blob/main/examples/independent-observations.json).
 - **Result:** `VERIFIED` for JSON syntax only. Both files parse as JSON; schema validation and fixture validation have not yet been run.
 - **Next:** Run a Draft 2020-12 validator, test valid and invalid records, and define the relationship-assessment schema.
+
+
+### `LOG-2026-10-26-009` — Add relationship assessment schema and CI validation
+- **Repository:** [Records-Deduplication-Suite](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite)
+- **Action:** Added a Draft 2020-12 relationship-assessment schema, a synthetic independent-observation assessment fixture, and a GitHub Actions workflow that checks schema validity and validates the fixture.
+- **Commits:**
+  - [Assessment schema](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/commit/f1544d863f550c018a7b971c7447ba59e1086ffa)
+  - [Assessment fixture](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/commit/e2136b40bf7a4e1d134e9272aefea5529abc6106)
+  - [Validation workflow](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/commit/e02bf28617a0a0d3895f77a68c47901da060258d)
+- **Documentation:** [README update](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/commit/e188151f7cc919a05eec197d1e593c4601345f2c)
+- **Checks:** GitHub Actions run [40453496942](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453496942) was observed in `queued` state; its validation result is not yet confirmed.
+- **Status:** `IN_PROGRESS`; do not mark schema/fixture `VERIFIED` until the workflow completes successfully and negative cases are tested.
+- **Design constraint:** The schema prevents a set of non-duplicate relationship classes from being marked `ELIGIBLE`, but this is an initial guardrail, not a complete policy engine or merge authorization mechanism.
+- **Next:** Confirm the workflow result; add invalid examples (for example, an independent observation marked eligible); align the procedure's decision table with the machine vocabulary.
