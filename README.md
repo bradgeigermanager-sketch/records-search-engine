@@ -1,6 +1,6 @@
 # Records Search Engine
 
-A provenance-preserving search engine prototype. Milestone 2 separates stable source identities from immutable document versions and records every ingestion attempt.
+A provenance-preserving search engine prototype. Milestone 3 adds typed entities, explicit relationships, and append-only structured metadata with provenance.
 
 ## Features
 - FastAPI JSON API and browser UI
@@ -10,6 +10,8 @@ A provenance-preserving search engine prototype. Milestone 2 separates stable so
 - Changed content creates a new version; unchanged retrievals are logged without duplicate versions
 - SQLite FTS5 current-version search by default, with optional historical search
 - Idempotent schema migration, including legacy v0.1 document migration
+- Typed entity registry and evidence-linked entity relationships with confidence and provenance
+- Append-only source metadata revisions with explicit supersession history
 - Automated tests, GitHub Actions CI, and Docker Compose deployment
 
 ## Run locally
@@ -44,7 +46,7 @@ Submit only sources you are authorized to retrieve; respect site terms, robots p
 
 ## Roadmap
 1. Source registry, immutable versions, and ingestion logs — implemented in v0.2.0
-2. PostgreSQL migration and structured metadata filters
-3. Archive connectors and respectful scheduled retrieval
-4. Language detection, synonyms, and semantic retrieval
-5. Entity registry, relationship graph, timelines, and evidence conflict views
+2. Typed entity registry, relationships, and append-only metadata — implemented in v0.3.0
+3. PostgreSQL migration and structured metadata filters
+4. Archive connectors and respectful scheduled retrieval
+5. Language detection, synonyms, timelines, and evidence-conflict views
