@@ -434,3 +434,44 @@ def test_validation_rule_sets_are_immutable(client):
             conn.execute('UPDATE stem_validation_rule_sets SET version=? WHERE id=?', ('0.3', rule_id))
         with pytest.raises(sqlite3.IntegrityError, match='immutable'):
             conn.execute('DELETE FROM stem_validation_rule_sets WHERE id=?', (rule_id,))
+
+
+def test_github_repository_ingestion_indexes_text_files_and_preserves_versions(client, monkeypatch):
+    def fake_get_json(url):
+        if url.endswith('/repos/example-owner/example-repo'):
+            return {'default_branch': 'main', 'private': False, 'html_url': 'https://github.com/example-owner/example-repo'}
+        if '/git/trees/' in url:
+            return {'truncated': False, 'tree': [
+                {'type': 'blob', 'path': 'README.md', 'sha': 'blob-readme', 'size': 20},
+                {'type': 'blob', 'path': 'docs/process.txt', 'sha': 'blob-process', 'size': 20},
+                {'type': 'blob', 'path': 'image.png', 'sha': 'blob-image', 'size': 20},
+                {'type': 'tree', 'path': 'docs'}
+            ]}
+        raise AssertionError('unexpected GitHub API URL: ' + url)
+
+    contents = {'blob-readme': '# Repository overview\n', 'blob-process': 'A repeatable process record.\n'}
+    monkeypatch.setattr(search_app, '_github_get_json', fake_get_json)
+    monkeypatch.setattr(search_app, '_github_text_blob', lambda url: next((v for k, v in contents.items() if k in url), None))
+    payload = {'owner': 'example-owner', 'repository': 'example-repo', 'max_files': 10}
+    first = client.post('/github/ingest-repository', json=payload)
+    assert first.status_code == 200
+    assert first.json()['files_indexed'] == 2
+    assert first.json()['ref'] == 'main'
+    assert first.json()['skipped']['binary_or_unsupported_extension'] == 1
+    second = client.post('/github/ingest-repository', json=payload)
+    assert second.status_code == 200
+    assert {item['outcome'] for item in second.json()['results']} == {'unchanged'}
+    assert client.get('/search', params={'q': 'repeatable process'}).status_code == 200
+
+def test_github_repository_ingestion_validates_request_and_tree_size(client, monkeypatch):
+    bad = client.post('/github/ingest-repository', json={'owner': '../bad', 'repository': 'repo'})
+    assert bad.status_code == 422
+    assert client.post('/github/ingest-repository', json={'owner': 'owner', 'repository': 'repo', 'max_files': 101}).status_code == 422
+
+    def fake_get_json(url):
+        if url.endswith('/repos/example-owner/large-repo'):
+            return {'default_branch': 'main', 'private': False, 'html_url': 'https://github.com/example-owner/large-repo'}
+        return {'truncated': True, 'tree': []}
+    monkeypatch.setattr(search_app, '_github_get_json', fake_get_json)
+    response = client.post('/github/ingest-repository', json={'owner': 'example-owner', 'repository': 'large-repo'})
+    assert response.status_code == 413
