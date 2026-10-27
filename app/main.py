@@ -582,6 +582,49 @@ def create_knowledge_edge(request: KnowledgeEdgeCreate):
             "object_kind": ok, "object_id": request.object_id, "evidence_page_revision_id": evidence,
             "confidence": request.confidence, "status": request.status, "provenance": request.provenance, "created_at": now}
 
+@app.get("/wiki/graph/{kind}/{node_id}")
+def get_knowledge_graph(kind: str, node_id: int, depth: int = Query(default=1, ge=1, le=3),
+                        include_rejected: bool = False, limit: int = Query(default=100, ge=1, le=500)):
+    if kind not in {"page", "artifact"}:
+        raise HTTPException(status_code=422, detail="kind must be page or artifact")
+    with connection() as conn:
+        if not _knowledge_node_exists(conn, kind, node_id):
+            raise HTTPException(status_code=404, detail="Graph starting node not found")
+        visited, frontier, edges_by_id = {(kind, node_id)}, [(kind, node_id, 0)], {}
+        while frontier and len(visited) < limit:
+            current_kind, current_id, level = frontier.pop(0)
+            if level >= depth:
+                continue
+            sql = "SELECT * FROM knowledge_edges WHERE ((subject_kind=? AND subject_id=?) OR (object_kind=? AND object_id=?))"
+            params = [current_kind, current_id, current_kind, current_id]
+            if not include_rejected:
+                sql += " AND status!='rejected'"
+            sql += " ORDER BY created_at DESC,id DESC LIMIT ?"
+            params.append(limit)
+            for edge in conn.execute(sql, params).fetchall():
+                edges_by_id[edge["id"]] = edge
+                other = (edge["object_kind"], edge["object_id"]) if (edge["subject_kind"], edge["subject_id"]) == (current_kind, current_id) else (edge["subject_kind"], edge["subject_id"])
+                if other not in visited and len(visited) < limit:
+                    visited.add(other)
+                    frontier.append((other[0], other[1], level + 1))
+        nodes = []
+        for node_kind, object_id in visited:
+            if node_kind == "page":
+                row = conn.execute("""SELECT p.slug,r.title,r.discipline,r.revision_number FROM wiki_page_revisions r
+                    JOIN wiki_pages p ON p.id=r.page_id WHERE r.id=?""", (object_id,)).fetchone()
+                if row:
+                    nodes.append({"kind":"page","id":object_id,"slug":row["slug"],"title":row["title"],"discipline":row["discipline"],"revision_number":row["revision_number"]})
+            else:
+                row = conn.execute("SELECT id,name,artifact_type,page_revision_id FROM stem_artifacts WHERE id=?", (object_id,)).fetchone()
+                if row:
+                    nodes.append({"kind":"artifact","id":object_id,"name":row["name"],"artifact_type":row["artifact_type"],"page_revision_id":row["page_revision_id"]})
+        edges = [{"edge_id":r["id"],"subject_kind":r["subject_kind"],"subject_id":r["subject_id"],"predicate":r["predicate"],
+                  "object_kind":r["object_kind"],"object_id":r["object_id"],"evidence_page_revision_id":r["evidence_page_revision_id"],
+                  "confidence":r["confidence"],"status":r["status"],"provenance":json.loads(r["provenance_json"]),"created_at":r["created_at"]}
+                 for r in edges_by_id.values()]
+    return {"root":{"kind":kind,"id":node_id},"depth":depth,"nodes":nodes,"edges":edges,
+            "note":"Relationships retain status, confidence, and provenance; a link is not by itself proof of truth."}
+
 @app.get("/wiki/edges")
 def list_knowledge_edges(subject_kind: str | None = None, subject_id: int | None = None,
                          object_kind: str | None = None, object_id: int | None = None,
