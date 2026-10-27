@@ -14,8 +14,8 @@ APP_NAME = "Records Search Engine"
 DB_PATH = os.getenv("SEARCH_DB_PATH", "search.db")
 MAX_BYTES = 2_000_000
 TIMEOUT_SECONDS = 12
-USER_AGENT = "RecordsSearchEngine/0.10 (+responsible research; contact site operator before bulk use)"
-app = FastAPI(title=APP_NAME, version="0.10.0", description="Provenance-preserving web-record search prototype")
+USER_AGENT = "RecordsSearchEngine/0.11 (+responsible research; contact site operator before bulk use)"
+app = FastAPI(title=APP_NAME, version="0.11.0", description="Provenance-preserving web-record search prototype")
 
 class IngestRequest(BaseModel):
     url: HttpUrl
@@ -26,6 +26,11 @@ class GitHubRepositoryIngestRequest(BaseModel):
     ref: str | None = None
     max_files: int = 50
     include_extensions: list[str] = [".md", ".txt", ".rst", ".py", ".json", ".yaml", ".yml", ".toml", ".sql", ".html", ".xml", ".csv"]
+
+class GitHubOwnerIngestRequest(BaseModel):
+    owner: str
+    max_repositories: int = 10
+    max_files_per_repository: int = 20
 class EntityCreate(BaseModel):
     canonical_name: str
     entity_type: str
@@ -405,6 +410,33 @@ def _github_text_blob(blob_url: str):
         return content.decode("utf-8")
     except (ValueError, UnicodeDecodeError):
         return None
+
+@app.post("/github/ingest-owner")
+def ingest_github_owner(request: GitHubOwnerIngestRequest):
+    owner = request.owner.strip()
+    if not owner or any(not (c.isalnum() or c in "-_") for c in owner):
+        raise HTTPException(status_code=422, detail="owner must be a GitHub username or organization name")
+    if request.max_repositories < 1 or request.max_repositories > 20:
+        raise HTTPException(status_code=422, detail="max_repositories must be between 1 and 20")
+    if request.max_files_per_repository < 1 or request.max_files_per_repository > 50:
+        raise HTTPException(status_code=422, detail="max_files_per_repository must be between 1 and 50")
+    if os.getenv("GITHUB_TOKEN"):
+        repositories = _github_get_json(f"{GITHUB_API}/user/repos?affiliation=owner&per_page=100&sort=updated")
+        repositories = [item for item in repositories if (item.get("owner") or {}).get("login", "").lower() == owner.lower()]
+    else:
+        repositories = _github_get_json(f"{GITHUB_API}/users/{quote(owner, safe='')}/repos?type=owner&per_page=100&sort=updated")
+    if not isinstance(repositories, list):
+        raise HTTPException(status_code=502, detail="GitHub repository listing returned an unexpected response")
+    repositories = [item for item in repositories if not item.get("fork") and not item.get("archived") and item.get("permissions", {}).get("pull", True)]
+    repositories = repositories[:request.max_repositories]
+    results, failures = [], []
+    for item in repositories:
+        try:
+            result = ingest_github_repository(GitHubRepositoryIngestRequest(owner=owner, repository=item["name"], max_files=request.max_files_per_repository))
+            results.append({"repository": item["name"], "private": bool(item.get("private")), "result": result})
+        except HTTPException as exc:
+            failures.append({"repository": item.get("name", "unknown"), "status_code": exc.status_code, "reason": str(exc.detail)})
+    return {"status": "completed", "owner": owner, "repositories_considered": len(repositories), "repositories_indexed": len(results), "repositories_failed": failures, "results": results, "note": "This bounded scan excludes forks and archived repositories. Private repositories are visible only when GITHUB_TOKEN grants access. Re-run this endpoint to detect updated files."}
 
 @app.post("/github/ingest-repository")
 def ingest_github_repository(request: GitHubRepositoryIngestRequest):
