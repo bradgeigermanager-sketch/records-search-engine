@@ -113,3 +113,12 @@ Copy this section for each substantive action:
 - **Verification:** Earlier schema/fixture run [40453548665](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453548665) passed; first negative test run [40453561754](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453561754) passed. Expanded regression run [40453597735](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453597735) was observed as `completed` with conclusion `success` when logged.
 - **Limit:** The table is a policy draft; it is not yet fully enforced by code or schema, and no merge execution engine exists in this repository.
 - **Next:** Confirm expanded CI outcome; reconcile the procedure's terminology and output fields with the schema; add positive/negative fixtures and check links.
+
+
+### `LOG-2026-10-26-012` — Align the RRD procedure with the controlled vocabulary and decision table
+- **Repository:** [Records-Deduplication-Suite](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite)
+- **Action:** Replaced legacy near-synonyms in the RRD procedure with the controlled relationship codes, revised eligibility guidance so `COPIED_FROM` is not itself merge authorization, and aligned recommended actions with the assessment schema and decision table.
+- **Commit:** [e280e85](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/commit/e280e85fbb0c36a7d30fd3d350aae7b23abebb7c)
+- **Verification:** [Expanded CI run](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453597735) passed. It checked both schemas against Draft 2020-12 and validated the assessment example plus negative cases for unsafe eligibility, missing rationale, and out-of-range confidence.
+- **Remaining limitations:** The decision table is a policy draft; the schema only enforces a subset of its rules. The original independent-observations example remains a conceptual fixture rather than a schema-validated DeduplicationRecordIR instance.
+- **Next:** Add valid/invalid record fixtures for the record schema, test relationship-code and action compatibility, inspect the rest of the owner repository inventory, and keep the registry/log synchronized.
