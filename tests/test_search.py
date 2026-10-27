@@ -671,3 +671,53 @@ def test_github_relationship_explorer_page_is_available(client):
     assert '/github/relationship-candidates' in response.text
     assert '/github/relationship-reviews' in response.text
     assert '/github/relationship-graph' in response.text
+
+
+def test_source_change_creates_immutable_relationship_staleness_event(client):
+    left_provenance = {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'change-a', 'path': 'README.md', 'git_blob_sha': 'old-a'}
+    right_provenance = {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'change-b', 'path': 'README.md', 'git_blob_sha': 'stable-b'}
+    left = search_app.save_document(
+        'https://github.com/example-owner/change-a/blob/main/README.md', 'change-a README',
+        'Original API contract.', 200, 'text/plain', left_provenance)
+    right = search_app.save_document(
+        'https://github.com/example-owner/change-b/blob/main/README.md', 'change-b README',
+        'Implementation of the original API contract.', 200, 'text/plain', right_provenance)
+    accepted = client.post('/github/relationship-reviews', json={
+        'from_source_id': left['source_id'], 'to_source_id': right['source_id'],
+        'decision': 'accepted', 'predicate': 'implements', 'reviewer': 'reviewer',
+        'rationale': 'The current source versions align.',
+        'evidence_snapshot': [{'version_ids': [left['version_id'], right['version_id']]}]
+    })
+    assert accepted.status_code == 200
+    relationship_id = accepted.json()['resulting_relationship_id']
+    changed = search_app.save_document(
+        'https://github.com/example-owner/change-a/blob/main/README.md', 'change-a README',
+        'Revised API contract with a changed method signature.', 200, 'text/plain',
+        {**left_provenance, 'git_blob_sha': 'new-a'})
+    assert changed['outcome'] == 'changed'
+    response = client.get('/github/relationship-change-events', params={'owner': 'example-owner', 'relationship_id': relationship_id})
+    assert response.status_code == 200
+    events = response.json()
+    assert len(events) == 1
+    assert events[0]['source_id'] == left['source_id']
+    assert events[0]['previous_version_id'] == left['version_id']
+    assert events[0]['current_version_id'] == changed['version_id']
+    assert events[0]['reviewed_version_id'] == left['version_id']
+    assert events[0]['revalidation_recommended'] is True
+    with search_app.connection() as conn:
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('UPDATE relationship_change_events SET reason=? WHERE id=?', ('silently cleared', events[0]['event_id']))
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('DELETE FROM relationship_change_events WHERE id=?', (events[0]['event_id'],))
+
+
+def test_unchanged_source_does_not_create_relationship_staleness_event(client):
+    provenance = {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'same-a', 'path': 'README.md'}
+    first = search_app.save_document(
+        'https://github.com/example-owner/same-a/blob/main/README.md', 'same-a README',
+        'Unchanged body.', 200, 'text/plain', provenance)
+    same = search_app.save_document(
+        'https://github.com/example-owner/same-a/blob/main/README.md', 'same-a README',
+        'Unchanged body.', 200, 'text/plain', provenance)
+    assert same['outcome'] == 'unchanged'
+    assert client.get('/github/relationship-change-events', params={'owner': 'example-owner'}).json() == []
