@@ -15,6 +15,7 @@ A provenance-preserving search engine with a versioned STEM Wiki, typed STEM art
 - Append-only source metadata revisions with explicit supersession history
 - STEM Wiki with immutable page revisions, full-text search, discipline/language filters, tags, references, and provenance
 - Structured immutable STEM artifacts for equations, constants, algorithms, and experiments, with a JSON editor in the page view
+- Provenance-aware knowledge graph connecting wiki revisions and artifacts with typed, append-only relationships and bounded traversal
 - Automated tests, GitHub Actions CI, and Docker Compose deployment
 
 ## Run locally
@@ -47,6 +48,8 @@ curl 'http://127.0.0.1:8000/wiki/search?q=force&discipline=physics'
 curl 'http://127.0.0.1:8000/wiki/pages/newton-second-law?include_history=true'
 curl -X POST http://127.0.0.1:8000/wiki/pages/newton-second-law/artifacts -H 'Content-Type: application/json' -d '{"artifact_type":"equation","name":"Newton second law","data":{"expression":"F = m * a","variables":[{"symbol":"F","meaning":"net force","unit":"N"},{"symbol":"m","meaning":"mass","unit":"kg"},{"symbol":"a","meaning":"acceleration","unit":"m/s^2"}]}}'
 curl 'http://127.0.0.1:8000/wiki/pages/newton-second-law/artifacts?artifact_type=equation'
+curl -X POST http://127.0.0.1:8000/wiki/edges -H 'Content-Type: application/json' -d '{"subject_kind":"page","subject_id":1,"predicate":"includes equation","object_kind":"artifact","object_id":1,"status":"proposed","confidence":0.9}'
+curl 'http://127.0.0.1:8000/wiki/graph/page/1?depth=2'
 curl 'http://127.0.0.1:8000/sources'
 curl 'http://127.0.0.1:8000/documents?include_history=true'
 ```
