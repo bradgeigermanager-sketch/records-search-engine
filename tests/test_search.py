@@ -114,3 +114,38 @@ def test_schema_migration_is_idempotent(client):
     search_app.init_db()
     with search_app.connection() as conn:
         assert conn.execute('SELECT COUNT(*) FROM schema_migrations WHERE version=1').fetchone()[0] == 1
+
+def test_entities_relationships_and_metadata_are_provenance_aware(client):
+    first = client.post('/entities', json={
+        'canonical_name': 'Example Archive', 'entity_type': 'organization',
+        'aliases': ['Archive Example'], 'provenance': {'source': 'test'}
+    })
+    second = client.post('/entities', json={'canonical_name': 'Example Record', 'entity_type': 'document'})
+    assert first.status_code == 200 and second.status_code == 200
+    a, b = first.json(), second.json()
+    rel = client.post('/relationships', json={
+        'subject_entity_id': a['entity_id'], 'predicate': 'maintains',
+        'object_entity_id': b['entity_id'], 'confidence': 0.9,
+        'provenance': {'method': 'manual_assertion'}
+    })
+    assert rel.status_code == 200
+    assert client.get(f"/entities/{a['entity_id']}").json()['relationships'][0]['object_entity_name'] == 'Example Record'
+
+    saved = search_app.save_document('https://example.org/metadata', 'Metadata source', 'metadata body', 200, 'text/html')
+    source_id = saved['source_id']
+    m1 = client.post(f'/sources/{source_id}/metadata', json={'key': 'language', 'value': 'en', 'provenance': {'method': 'header'}})
+    m2 = client.post(f'/sources/{source_id}/metadata', json={'key': 'language', 'value': 'fr', 'provenance': {'method': 'review'}})
+    assert m1.status_code == 200 and m2.status_code == 200
+    assert m2.json()['supersedes_id'] == m1.json()['metadata_id']
+    current = client.get(f'/sources/{source_id}/metadata').json()
+    history = client.get(f'/sources/{source_id}/metadata?include_history=true').json()
+    assert len(current) == 1 and current[0]['value'] == 'fr' and current[0]['is_current']
+    assert len(history) == 2 and sum(x['is_current'] for x in history) == 1
+
+def test_relationship_requires_exactly_one_object(client):
+    entity = client.post('/entities', json={'canonical_name': 'Only entity', 'entity_type': 'thing'}).json()
+    response = client.post('/relationships', json={
+        'subject_entity_id': entity['entity_id'], 'predicate': 'related_to'
+    })
+    assert response.status_code == 422
+
