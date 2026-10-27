@@ -15,7 +15,7 @@ DB_PATH = os.getenv("SEARCH_DB_PATH", "search.db")
 MAX_BYTES = 2_000_000
 TIMEOUT_SECONDS = 12
 USER_AGENT = "RecordsSearchEngine/0.11 (+responsible research; contact site operator before bulk use)"
-app = FastAPI(title=APP_NAME, version="0.16.0", description="Provenance-preserving web-record search prototype")
+app = FastAPI(title=APP_NAME, version="0.17.0", description="Provenance-preserving web-record search prototype")
 
 class IngestRequest(BaseModel):
     url: HttpUrl
@@ -135,6 +135,9 @@ class SearchResult(BaseModel):
     retrieved_at: str
     content_hash: str
     is_current: bool
+    matched_terms: list[str] = []
+    match_reasons: list[str] = []
+    relevance_score: float = 0.0
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
@@ -660,15 +663,19 @@ def github_search(q: str = Query(min_length=1, max_length=300),
             snippet(versions_fts,1,'<mark>','</mark>',' … ',24) excerpt
             FROM versions_fts JOIN document_versions v ON v.id=versions_fts.rowid
             JOIN sources s ON s.id=v.source_id WHERE """ + " AND ".join(clauses) +
-            " ORDER BY bm25(versions_fts),v.retrieved_at DESC LIMIT ?", params).fetchall()
-    return [{"source_id": r["source_id"], "version_id": r["version_id"], "version_number": r["version_number"],
+            " ORDER BY bm25(versions_fts,8.0,1.0),v.retrieved_at DESC LIMIT ?", params).fetchall()
+    results = []
+    for r in rows:
+        explanation = _search_explanation(q, r["title"], r["body"], mode, field)
+        results.append({"source_id": r["source_id"], "version_id": r["version_id"], "version_number": r["version_number"],
              "title": r["title"], "url": r["url"], "excerpt": r["excerpt"] or r["body"][:240],
              "retrieved_at": r["retrieved_at"], "content_hash": r["content_hash"],
              "is_current": r["current_version_id"] == r["version_id"], "owner": r["owner"],
              "repository": r["repository"], "ref": r["ref"], "path": r["path"],
              "repository_url": r["repository_url"], "file_url": r["url"],
              "source_navigation": f"/sources/{r['source_id']}",
-             "history_navigation": f"/sources/{r['source_id']}/versions"} for r in rows]
+             "history_navigation": f"/sources/{r['source_id']}/versions", **explanation})
+    return results
 
 
 @app.get("/github/repositories")
@@ -1062,6 +1069,48 @@ def _build_search_match(q: str, mode: str = "all", field: str = "both") -> str:
         return "body : (" + expression + ")"
     return expression
 
+def _search_explanation(q: str, title: str, body: str, mode: str, field: str) -> dict:
+    """Return transparent, rule-based match evidence; this is not a probability."""
+    tokens = list(dict.fromkeys(re.findall(r"\\w+", q.casefold(), flags=re.UNICODE)))
+    title_tokens = re.findall(r"\\w+", (title or "").casefold(), flags=re.UNICODE)
+    body_tokens = re.findall(r"\\w+", (body or "").casefold(), flags=re.UNICODE)
+    title_set, body_set = set(title_tokens), set(body_tokens)
+    def matches(term: str, token_set: set[str]) -> bool:
+        if mode == "prefix":
+            return any(token.startswith(term) for token in token_set)
+        return term in token_set
+    title_hits = [term for term in tokens if matches(term, title_set)]
+    body_hits = [term for term in tokens if matches(term, body_set)]
+    eligible_title = field in ("both", "title")
+    eligible_body = field in ("both", "body")
+    matched = [term for term in tokens if
+               (eligible_title and matches(term, title_set)) or
+               (eligible_body and matches(term, body_set))]
+    reasons = []
+    if eligible_title and title_hits:
+        reasons.append("title match: " + ", ".join(title_hits))
+    if eligible_body and body_hits:
+        reasons.append("body match: " + ", ".join(body_hits))
+    normalized_query = " ".join(tokens)
+    normalized_title = " ".join(title_tokens)
+    normalized_body = " ".join(body_tokens)
+    if mode == "phrase" and normalized_query:
+        if eligible_title and normalized_query in normalized_title:
+            reasons.append("exact phrase in title")
+        elif eligible_body and normalized_query in normalized_body:
+            reasons.append("exact phrase in body")
+    elif mode != "phrase" and normalized_query:
+        if eligible_title and normalized_query in normalized_title:
+            reasons.append("full query text appears in title")
+        elif eligible_body and normalized_query in normalized_body:
+            reasons.append("full query text appears in body")
+    denominator = max(1, len(tokens))
+    score = min(100.0, round(
+        60.0 * len(set(title_hits if eligible_title else [])) / denominator
+        + 30.0 * len(set(body_hits if eligible_body else [])) / denominator
+        + (10.0 if any(reason.startswith("exact phrase") for reason in reasons) else 0.0), 2))
+    return {"matched_terms": matched, "match_reasons": reasons, "relevance_score": score}
+
 @app.get("/search",response_model=list[SearchResult])
 def search(q:str=Query(min_length=1,max_length=300),limit:int=Query(default=10,ge=1,le=50),
            include_history:bool=False,metadata_key:str|None=None,metadata_value:str|None=None,
@@ -1072,8 +1121,15 @@ def search(q:str=Query(min_length=1,max_length=300),limit:int=Query(default=10,g
     filter_sql='' if include_history else 'AND s.current_version_id=v.id'
     metadata_sql, metadata_params = _metadata_filter_sql(metadata_key, metadata_value)
     with connection() as conn:
-        rows=conn.execute(f"""SELECT v.id,v.source_id,v.version_number,v.title,s.canonical_url,v.body,v.retrieved_at,v.content_hash,s.current_version_id,snippet(versions_fts,1,'<mark>','</mark>',' … ',24) excerpt FROM versions_fts JOIN document_versions v ON v.id=versions_fts.rowid JOIN sources s ON s.id=v.source_id WHERE versions_fts MATCH ? {filter_sql} {metadata_sql} ORDER BY bm25(versions_fts),v.retrieved_at DESC LIMIT ?""",(match,*metadata_params,limit)).fetchall()
-    return [SearchResult(document_id=r["id"],version_id=r["id"],source_id=r["source_id"],version_number=r["version_number"],title=r["title"],url=r["canonical_url"],excerpt=r["excerpt"] or r["body"][:240],retrieved_at=r["retrieved_at"],content_hash=r["content_hash"],is_current=r["current_version_id"]==r["id"]) for r in rows]
+        rows=conn.execute(f"""SELECT v.id,v.source_id,v.version_number,v.title,s.canonical_url,v.body,v.retrieved_at,v.content_hash,s.current_version_id,snippet(versions_fts,1,'<mark>','</mark>',' … ',24) excerpt FROM versions_fts JOIN document_versions v ON v.id=versions_fts.rowid JOIN sources s ON s.id=v.source_id WHERE versions_fts MATCH ? {filter_sql} {metadata_sql} ORDER BY bm25(versions_fts,8.0,1.0),v.retrieved_at DESC LIMIT ?""",(match,*metadata_params,limit)).fetchall()
+    results = []
+    for r in rows:
+        explanation = _search_explanation(q, r["title"], r["body"], mode, field)
+        results.append(SearchResult(document_id=r["id"],version_id=r["id"],source_id=r["source_id"],
+            version_number=r["version_number"],title=r["title"],url=r["canonical_url"],
+            excerpt=r["excerpt"] or r["body"][:240],retrieved_at=r["retrieved_at"],
+            content_hash=r["content_hash"],is_current=r["current_version_id"]==r["id"],**explanation))
+    return results
 
 @app.get("/documents")
 def documents(limit:int=Query(default=20,ge=1,le=100),include_history:bool=False,
