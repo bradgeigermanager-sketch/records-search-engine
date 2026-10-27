@@ -105,3 +105,14 @@ Optional parameters:
 - `limit` (1–200, default 50): maximum candidate links returned.
 
 Every candidate includes its two file endpoints, score, evidence categories, and a suggested relationship predicate. Results are labeled `candidate_only` and require review. The detector does **not** automatically create graph edges or save candidate relationships. After reviewing a candidate, use `POST /github/repository-relationships` to record an explicit, provenance-linked assertion when justified. The current scan is bounded and examines pairs within the selected current-source set; if `scan_truncated` is true, increase `max_sources` or index/filter the repositories more narrowly. A heuristic score is a ranking aid, not a probability or proof.
+
+
+## Relationship review and graph
+
+- `POST /github/relationship-reviews` records an immutable review decision. Use `decision=accepted`, `rejected`, or `disputed`, and provide reviewer, rationale, confidence, evidence snapshot, and provenance as appropriate.
+- An accepted review creates a `supported` cross-repository relationship. Rejected or disputed reviews remain in the review log and do not create a supported graph edge.
+- `GET /github/relationship-reviews?owner=YOUR_OWNER` lists decisions; add `decision=accepted|rejected|disputed` to filter.
+- `GET /github/relationship-graph?owner=YOUR_OWNER` returns a JSON graph with file/source nodes and explicit stored relationship edges. By default, it includes supported edges only. Add `include_proposed=true` to include proposed and disputed edges too.
+- Graph nodes include source and version-history navigation. Edge provenance records the reviewed source versions and the review rationale/evidence snapshot when the edge was accepted.
+
+Review decisions and relationship records are append-only. A later disagreement should be recorded as another review, not as an edit to an earlier decision. The graph API returns data for a visualization client; it does not itself draw an interactive graph.
