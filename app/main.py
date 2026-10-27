@@ -1,6 +1,6 @@
 """Records Search Engine — source registry and immutable content versions."""
 from __future__ import annotations
-import base64, hashlib, ipaddress, json, math, os, socket, sqlite3
+import base64, hashlib, ipaddress, json, math, os, re, socket, sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urldefrag, urlunparse, quote
@@ -15,7 +15,7 @@ DB_PATH = os.getenv("SEARCH_DB_PATH", "search.db")
 MAX_BYTES = 2_000_000
 TIMEOUT_SECONDS = 12
 USER_AGENT = "RecordsSearchEngine/0.11 (+responsible research; contact site operator before bulk use)"
-app = FastAPI(title=APP_NAME, version="0.12.0", description="Provenance-preserving web-record search prototype")
+app = FastAPI(title=APP_NAME, version="0.13.0", description="Provenance-preserving web-record search prototype")
 
 class IngestRequest(BaseModel):
     url: HttpUrl
@@ -610,6 +610,111 @@ def github_repository_files(owner: str, repository: str,
              "content_hash": r["content_hash"], "retrieved_at": r["retrieved_at"], "is_current": bool(r["is_current"]),
              "source_navigation": f"/sources/{r['source_id']}",
              "history_navigation": f"/sources/{r['source_id']}/versions"} for r in rows]
+
+
+
+@app.get("/github/relationship-candidates")
+def github_relationship_candidates(
+    owner: str = Query(min_length=1, max_length=100),
+    max_sources: int = Query(default=300, ge=2, le=500),
+    min_score: int = Query(default=10, ge=1, le=100),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """Propose explainable cross-repository file links; never auto-assert or persist them."""
+    owner = owner.strip()
+    if not owner or any(c.isspace() for c in owner) or "/" in owner:
+        raise HTTPException(status_code=422, detail="owner must be a GitHub owner name")
+    with connection() as conn:
+        rows = conn.execute("""SELECT s.id source_id,s.canonical_url file_url,s.provenance_json source_provenance,
+            v.id version_id,v.title,v.body,v.content_hash,v.provenance_json version_provenance
+            FROM sources s JOIN document_versions v ON v.id=s.current_version_id
+            WHERE lower(json_extract(s.provenance_json,'$.method'))='github_repository_ingestion'
+              AND lower(json_extract(s.provenance_json,'$.owner'))=lower(?)
+            ORDER BY s.id LIMIT ?""", (owner, max_sources)).fetchall()
+        total = conn.execute("""SELECT COUNT(*) FROM sources s WHERE
+            lower(json_extract(s.provenance_json,'$.method'))='github_repository_ingestion'
+            AND lower(json_extract(s.provenance_json,'$.owner'))=lower(?)""", (owner,)).fetchone()[0]
+    documents = []
+    for row in rows:
+        source_meta = json.loads(row["source_provenance"] or "{}")
+        version_meta = json.loads(row["version_provenance"] or "{}")
+        meta = {**source_meta, **version_meta}
+        body = row["body"] or ""
+        repo_name = meta.get("repository", "")
+        path = meta.get("path", "")
+        # Normalize common identifiers, import/dependency names, and explicit GitHub file references.
+        identifiers = set(re.findall(r"(?i)\b(?:[0-9a-f]{8}-[0-9a-f-]{27,}|[A-Z]{2,12}-\d{2,}|(?:doi:)?10\.\d{4,9}/[-._;()/:A-Z0-9]+)\b", body))
+        identifiers = {x.lower().rstrip(".,;:)") for x in identifiers if len(x) >= 8}
+        dependencies = set()
+        for pattern in (
+            r"(?m)^\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_.-]*)",
+            r"(?m)^\s*([A-Za-z0-9][A-Za-z0-9_.-]*)\s*(?:==|>=|<=|~=|!=|>|<)",
+            r'(?m)^\s*["\']([A-Za-z_][A-Za-z0-9_.-]*)["\']\s*=\s*["\']',
+        ):
+            dependencies.update(x.lower().split(".")[0] for x in re.findall(pattern, body))
+        explicit = set()
+        for match in re.finditer(r"https?://github\.com/([^/\s?#]+)/([^/\s?#]+)/blob/[^/\s?#]+/([^\s?#)\"'<>]+)", body, re.I):
+            link_owner, link_repo, link_path = match.groups()
+            explicit.add((link_owner.lower(), link_repo.lower(), link_path.rstrip(".,;").lower()))
+        terms = set(re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{4,}", (row["title"] or "") + " " + path + " " + body[:100_000].lower()))
+        terms -= {"https", "httpsgithubcom", "false", "true", "return", "class", "function", "import", "from", "this", "that", "with", "which", "should", "their", "about", "these", "those", "using", "source", "file", "readme", "github", "owner", "repository"}
+        documents.append({
+            "source_id": row["source_id"], "version_id": row["version_id"], "file_url": row["file_url"],
+            "repository": repo_name, "path": path, "title": row["title"], "content_hash": row["content_hash"],
+            "ref": meta.get("ref"), "identifiers": identifiers, "dependencies": dependencies,
+            "explicit": explicit, "terms": terms,
+        })
+    # Build exact cross-repository lookup for explicit GitHub blob links.
+    path_index = {}
+    for doc in documents:
+        path_index[(owner.lower(), str(doc["repository"]).lower(), str(doc["path"]).lower())] = doc
+    proposals = {}
+    for i, left in enumerate(documents):
+        for right in documents[i + 1:]:
+            if str(left["repository"]).lower() == str(right["repository"]).lower():
+                continue
+            evidence = []
+            score = 0
+            left_key = (owner.lower(), str(left["repository"]).lower(), str(left["path"]).lower())
+            right_key = (owner.lower(), str(right["repository"]).lower(), str(right["path"]).lower())
+            if right_key in left["explicit"] or left_key in right["explicit"]:
+                evidence.append({"type": "explicit_github_file_reference", "detail": "One file contains a direct GitHub blob URL to the other"})
+                score += 100
+            shared_ids = sorted(left["identifiers"] & right["identifiers"])
+            if shared_ids:
+                evidence.append({"type": "shared_identifier", "values": shared_ids[:10]})
+                score += min(80, 35 + 15 * (len(shared_ids) - 1))
+            shared_dependencies = sorted(left["dependencies"] & right["dependencies"])
+            # Dependency signals only count when the shared token is distinctive and present in a file path/name.
+            path_tokens = set(re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{3,}", left["path"] + " " + right["path"]))
+            dependency_hits = sorted(set(shared_dependencies) & {x.lower() for x in path_tokens})
+            if dependency_hits:
+                evidence.append({"type": "dependency_or_import_name_matches_file_path", "values": dependency_hits[:10]})
+                score += min(60, 30 + 10 * (len(dependency_hits) - 1))
+            shared_terms = sorted(left["terms"] & right["terms"])
+            # Avoid generic similarity claims: only report rare-ish terms with concrete names, not every shared word.
+            if shared_terms:
+                evidence.append({"type": "shared_distinctive_terms", "values": shared_terms[:12]})
+                score += min(25, 5 * min(5, len(shared_terms)))
+            if score < min_score:
+                continue
+            key = (left["source_id"], right["source_id"])
+            proposals[key] = {
+                "from_source_id": left["source_id"], "to_source_id": right["source_id"],
+                "from": {"repository": left["repository"], "path": left["path"], "title": left["title"],
+                         "file_url": left["file_url"], "version_id": left["version_id"]},
+                "to": {"repository": right["repository"], "path": right["path"], "title": right["title"],
+                       "file_url": right["file_url"], "version_id": right["version_id"]},
+                "score": min(100, score), "status": "candidate_only",
+                "suggested_predicate": "references" if any(e["type"] == "explicit_github_file_reference" for e in evidence) else "possibly_related_to",
+                "evidence": evidence,
+                "review_required": True,
+            }
+    results = sorted(proposals.values(), key=lambda item: (-item["score"], item["from_source_id"], item["to_source_id"]))[:limit]
+    return {"owner": owner, "sources_scanned": len(documents), "sources_available": total,
+            "scan_truncated": total > len(documents), "candidate_count_returned": len(results),
+            "min_score": min_score, "candidates": results,
+            "note": "Heuristic candidates are not verified facts and are not saved as relationships. Review evidence and create an explicit relationship only when justified."}
 
 
 @app.post("/github/repository-relationships")
