@@ -15,7 +15,7 @@ DB_PATH = os.getenv("SEARCH_DB_PATH", "search.db")
 MAX_BYTES = 2_000_000
 TIMEOUT_SECONDS = 12
 USER_AGENT = "RecordsSearchEngine/0.11 (+responsible research; contact site operator before bulk use)"
-app = FastAPI(title=APP_NAME, version="0.15.0", description="Provenance-preserving web-record search prototype")
+app = FastAPI(title=APP_NAME, version="0.16.0", description="Provenance-preserving web-record search prototype")
 
 class IngestRequest(BaseModel):
     url: HttpUrl
@@ -60,6 +60,16 @@ class RepositoryRelationshipReviewCreate(BaseModel):
     predicate: str = "possibly_related_to"
     reviewer: str = "unspecified"
     rationale: str = ""
+    confidence: float | None = None
+    evidence_snapshot: list[dict] = []
+    provenance: dict = {}
+
+class RepositoryRelationshipRevalidationCreate(BaseModel):
+    event_id: int
+    decision: str
+    reviewer: str = "unspecified"
+    rationale: str
+    predicate: str | None = None
     confidence: float | None = None
     evidence_snapshot: list[dict] = []
     provenance: dict = {}
@@ -394,6 +404,27 @@ def init_db():
             CREATE TRIGGER IF NOT EXISTS repository_relationships_no_delete BEFORE DELETE ON repository_relationships BEGIN SELECT RAISE(ABORT,'repository relationships are immutable'); END;
             """)
             conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(8,?)", (utc_now(),))
+
+        if 11 not in applied:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS relationship_revalidations (
+                id INTEGER PRIMARY KEY,
+                event_id INTEGER NOT NULL REFERENCES relationship_change_events(id),
+                relationship_id INTEGER NOT NULL REFERENCES repository_relationships(id),
+                decision TEXT NOT NULL CHECK(decision IN ('reaffirmed','revised','disputed','no_longer_supported')),
+                reviewer TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                replacement_relationship_id INTEGER REFERENCES repository_relationships(id),
+                evidence_snapshot_json TEXT NOT NULL DEFAULT '[]',
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                UNIQUE(event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_relationship_revalidations_relationship ON relationship_revalidations(relationship_id,created_at DESC);
+            CREATE TRIGGER IF NOT EXISTS relationship_revalidations_no_update BEFORE UPDATE ON relationship_revalidations BEGIN SELECT RAISE(ABORT,'relationship revalidations are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS relationship_revalidations_no_delete BEFORE DELETE ON relationship_revalidations BEGIN SELECT RAISE(ABORT,'relationship revalidations are immutable'); END;
+            """)
+            conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(11,?)", (utc_now(),))
 
         if 10 not in applied:
             conn.executescript("""
@@ -906,6 +937,7 @@ def github_relationship_graph(owner: str = Query(min_length=1, max_length=100),
             JOIN sources ts ON ts.id=rr.to_source_id
             WHERE lower(json_extract(fs.provenance_json,'$.owner'))=lower(?)
               AND lower(json_extract(ts.provenance_json,'$.owner'))=lower(?)
+              AND NOT EXISTS (SELECT 1 FROM relationship_revalidations rv WHERE rv.relationship_id=rr.id)
               AND rr.status IN (""" + placeholders + ") ORDER BY rr.id LIMIT ?",
               (owner, owner, *statuses, limit)).fetchall()
     nodes = [{"id": r["id"], "label": r["title"] or r["path"] or r["canonical_url"],
@@ -1626,6 +1658,97 @@ def wiki_home():
 def home():
     return HTMLResponse("""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Records Search Engine</title><style>body{font:16px system-ui;max-width:900px;margin:3rem auto;padding:0 1rem;color:#202124}input{padding:.7rem;width:min(65%,520px)}button{padding:.75rem;cursor:pointer}.muted{color:#666}.result{border-top:1px solid #ddd;padding:1rem 0}</style></head><body><h1>Records Search Engine</h1><p><a href="/wiki">Open STEM Wiki</a> · <a href="/github/explorer">Open GitHub Relationship Explorer</a></p><p class="muted">Search indexed web records or add a public HTML page. Source versions are preserved.</p><form id="search"><input id="q" placeholder="Search indexed records" required><label><input id="history" type="checkbox" style="width:auto"> Include historical versions</label><button>Search</button></form><h2>Add a source</h2><form id="ingest"><input id="url" type="url" placeholder="https://example.org/page" required><button>Index URL</button></form><p id="status" class="muted"></p><section id="results"></section><script>const status=document.querySelector('#status'),results=document.querySelector('#results');document.querySelector('#search').addEventListener('submit',async e=>{e.preventDefault();status.textContent='Searching…';results.replaceChildren();const q=document.querySelector('#q').value,history=document.querySelector('#history').checked,r=await fetch('/search?q='+encodeURIComponent(q)+'&include_history='+history),data=await r.json();status.textContent=data.length+' result(s)';for(const x of data){const el=document.createElement('article');el.className='result';const h=document.createElement('h3'),a=document.createElement('a');a.href=x.url;a.target='_blank';a.rel='noopener noreferrer';a.textContent=x.title;h.append(a);const p=document.createElement('p');p.textContent=x.excerpt.replace(/<\/?mark>/g,'');const s=document.createElement('small');s.textContent='Source #'+x.source_id+' · Version '+x.version_number+(x.is_current?' (current)':' (historical)');el.append(h,p,s);results.append(el)}});document.querySelector('#ingest').addEventListener('submit',async e=>{e.preventDefault();status.textContent='Retrieving and indexing…';const r=await fetch('/ingest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:document.querySelector('#url').value})}),data=await r.json();status.textContent=r.ok?'Indexed: '+data.title+' ('+data.outcome+')':(data.detail||'Ingestion failed')});</script></body></html>""")
 
+
+
+
+@app.post("/github/relationship-revalidations")
+def revalidate_github_relationship(request: RepositoryRelationshipRevalidationCreate):
+    """Append a revalidation decision tied to a recorded source-change event."""
+    decision = request.decision.strip().lower()
+    reviewer = request.reviewer.strip()[:200] or "unspecified"
+    rationale = request.rationale.strip()[:5000]
+    if decision not in {"reaffirmed", "revised", "disputed", "no_longer_supported"}:
+        raise HTTPException(status_code=422, detail="decision must be reaffirmed, revised, disputed, or no_longer_supported")
+    if not rationale:
+        raise HTTPException(status_code=422, detail="rationale is required")
+    if request.confidence is not None and not 0 <= request.confidence <= 1:
+        raise HTTPException(status_code=422, detail="confidence must be between 0 and 1")
+    now = utc_now()
+    with connection() as conn:
+        event = conn.execute("""SELECT e.*,rr.from_source_id,rr.to_source_id,rr.predicate old_predicate,
+            rr.confidence old_confidence,rr.status old_status,rr.provenance_json old_provenance
+            FROM relationship_change_events e JOIN repository_relationships rr ON rr.id=e.relationship_id
+            WHERE e.id=?""", (request.event_id,)).fetchone()
+        if event is None:
+            raise HTTPException(status_code=404, detail="Relationship change event not found")
+        if conn.execute("SELECT 1 FROM relationship_revalidations WHERE event_id=?", (request.event_id,)).fetchone():
+            raise HTTPException(status_code=409, detail="This change event already has a revalidation decision; create a new source-change event for another review")
+        left = conn.execute("SELECT current_version_id FROM sources WHERE id=?", (event["from_source_id"],)).fetchone()
+        right = conn.execute("SELECT current_version_id FROM sources WHERE id=?", (event["to_source_id"],)).fetchone()
+        if left is None or right is None or left["current_version_id"] is None or right["current_version_id"] is None:
+            raise HTTPException(status_code=409, detail="Both relationship sources must have current versions before revalidation")
+        predicate = (request.predicate or event["old_predicate"]).strip()
+        if decision in {"reaffirmed", "revised"} and (not predicate or len(predicate) > 200):
+            raise HTTPException(status_code=422, detail="predicate must contain 1 to 200 characters")
+        replacement_id = None
+        if decision in {"reaffirmed", "revised"}:
+            old_provenance = json.loads(event["old_provenance"] or "{}")
+            new_provenance = {
+                "revalidation_of_relationship_id": event["relationship_id"],
+                "revalidation_event_id": request.event_id,
+                "decision": decision, "reviewer": reviewer, "rationale": rationale,
+                "evidence_snapshot": request.evidence_snapshot,
+                "review_provenance": request.provenance,
+                "source_versions": {"from": left["current_version_id"], "to": right["current_version_id"]},
+                "previous_source_versions": old_provenance.get("source_versions", {}),
+            }
+            cur = conn.execute("""INSERT INTO repository_relationships
+                (from_source_id,to_source_id,predicate,confidence,status,provenance_json,created_at)
+                VALUES(?,?,?,?,?,?,?)""", (event["from_source_id"], event["to_source_id"], predicate,
+                request.confidence if request.confidence is not None else event["old_confidence"],
+                "supported", json.dumps(new_provenance, ensure_ascii=False, sort_keys=True), now))
+            replacement_id = cur.lastrowid
+        cur = conn.execute("""INSERT INTO relationship_revalidations
+            (event_id,relationship_id,decision,reviewer,rationale,replacement_relationship_id,evidence_snapshot_json,provenance_json,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?)""", (request.event_id, event["relationship_id"], decision, reviewer, rationale,
+            replacement_id, json.dumps(request.evidence_snapshot, ensure_ascii=False, sort_keys=True),
+            json.dumps(request.provenance, ensure_ascii=False, sort_keys=True), now))
+        return {"revalidation_id": cur.lastrowid, "event_id": request.event_id,
+            "relationship_id": event["relationship_id"], "decision": decision,
+            "replacement_relationship_id": replacement_id, "reviewer": reviewer,
+            "rationale": rationale, "created_at": now,
+            "note": "Historical relationship and prior review records are retained; current graph omits superseded or no-longer-supported edges."}
+
+
+@app.get("/github/relationship-revalidations")
+def list_github_relationship_revalidations(owner: str | None = None,
+                                           relationship_id: int | None = Query(default=None, ge=1),
+                                           limit: int = Query(default=100, ge=1, le=500)):
+    clauses = ["1=1"]
+    params = []
+    if owner:
+        clauses.append("""(lower(json_extract(fs.provenance_json,'$.owner'))=lower(?)
+            OR lower(json_extract(ts.provenance_json,'$.owner'))=lower(?))""")
+        params.extend([owner.strip(), owner.strip()])
+    if relationship_id is not None:
+        clauses.append("rv.relationship_id=?")
+        params.append(relationship_id)
+    params.append(limit)
+    with connection() as conn:
+        rows = conn.execute("""SELECT rv.*,e.source_id changed_source_id,e.previous_version_id,e.current_version_id,
+            fs.canonical_url from_url,ts.canonical_url to_url
+            FROM relationship_revalidations rv
+            JOIN relationship_change_events e ON e.id=rv.event_id
+            JOIN repository_relationships rr ON rr.id=rv.relationship_id
+            JOIN sources fs ON fs.id=rr.from_source_id JOIN sources ts ON ts.id=rr.to_source_id
+            WHERE """ + " AND ".join(clauses) + " ORDER BY rv.created_at DESC,rv.id DESC LIMIT ?", params).fetchall()
+    return [{"revalidation_id": r["id"], "event_id": r["event_id"], "relationship_id": r["relationship_id"],
+        "decision": r["decision"], "reviewer": r["reviewer"], "rationale": r["rationale"],
+        "replacement_relationship_id": r["replacement_relationship_id"], "changed_source_id": r["changed_source_id"],
+        "previous_version_id": r["previous_version_id"], "current_version_id": r["current_version_id"],
+        "from_url": r["from_url"], "to_url": r["to_url"],
+        "evidence_snapshot": json.loads(r["evidence_snapshot_json"]), "provenance": json.loads(r["provenance_json"]),
+        "created_at": r["created_at"]} for r in rows]
 
 
 @app.get("/github/relationship-change-events")
