@@ -400,3 +400,37 @@ def test_stem_validator_detects_incomplete_experiment_and_unit_mismatch(client):
     unit_report = client.post(f"/wiki/artifacts/{equation['artifact_id']}/validate").json()
     assert unit_report['outcome'] == 'fail'
     assert any('dimensionally incompatible' in e for e in unit_report['errors'])
+
+
+def test_versioned_validation_rules_and_compound_units(client):
+    rules = client.get('/wiki/validation-rule-sets')
+    assert rules.status_code == 200
+    assert any(item['name'] == 'stem-core' and item['version'] == '0.2' for item in rules.json())
+
+    page = client.post('/wiki/pages', json={
+        'slug': 'compound-unit-check', 'title': 'Compound unit check',
+        'body': 'Check supported compound units.', 'discipline': 'physics'
+    }).json()
+    good = client.post('/wiki/pages/compound-unit-check/artifacts', json={
+        'artifact_type': 'equation', 'name': 'Force dimensions',
+        'data': {'expression': 'F = m * a', 'variables': [
+            {'symbol': 'F', 'meaning': 'force', 'unit': 'N'},
+            {'symbol': 'm', 'meaning': 'mass', 'unit': 'kg'},
+            {'symbol': 'a', 'meaning': 'acceleration', 'unit': 'm/s^2'}
+        ], 'lhs_unit': 'N', 'rhs_unit': 'kg*m/s^2'}
+    }).json()
+    report = client.post(f"/wiki/artifacts/{good['artifact_id']}/validate")
+    assert report.status_code == 200
+    assert report.json()['validator_version'] == '0.2'
+    assert report.json()['rule_set'] == {'name': 'stem-core', 'version': '0.2'}
+    assert report.json()['outcome'] != 'fail'
+    assert any('dimensionally compatible' in check for check in report.json()['checks'])
+
+def test_validation_rule_sets_are_immutable(client):
+    client.get('/wiki/validation-rule-sets')
+    with search_app.connection() as conn:
+        rule_id = conn.execute("SELECT id FROM stem_validation_rule_sets WHERE name='stem-core'").fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('UPDATE stem_validation_rule_sets SET version=? WHERE id=?', ('0.3', rule_id))
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('DELETE FROM stem_validation_rule_sets WHERE id=?', (rule_id,))
