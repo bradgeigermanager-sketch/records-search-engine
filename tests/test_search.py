@@ -233,6 +233,7 @@ def test_stem_wiki_browser_pages_and_migration(client):
     })
     view = client.get('/wiki/view/basic-algebra')
     assert view.status_code == 200 and 'STEM Wiki Page' in view.text
+    assert 'Structured STEM artifacts' in view.text and 'Data (JSON)' in view.text
     search_app.init_db()
     with search_app.connection() as conn:
         assert conn.execute('SELECT COUNT(*) FROM schema_migrations WHERE version=3').fetchone()[0] == 1
