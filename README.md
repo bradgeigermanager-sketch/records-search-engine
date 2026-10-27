@@ -186,3 +186,20 @@ Each result includes:
 - `relevance_score`: a transparent rule-based score from 0 to 100. It is a ranking aid, **not** a probability, truth rating, or source-quality assessment.
 
 The score favors query-term coverage in titles, then body text, with a phrase bonus. FTS5's weighted ranking orders the results; the explanation fields show why each result matched. A high score does not validate a source's claims.
+
+## Search filters: domain, media type, and retrieval date
+
+Both `GET /search` and `GET /github/search` support additional optional filters:
+- `domain`: exact hostname match, e.g. `domain=example.org` (does not include subdomains).
+- `content_type`: media-type match by prefix, e.g. `text/plain`; a trailing wildcard such as `text/*` matches a media-type family.
+- `retrieved_after` and `retrieved_before`: inclusive ISO 8601 date or datetime bounds. Naive dates/times are interpreted as UTC. If both are supplied, the lower bound must not exceed the upper bound.
+
+These filters combine with the search mode, field scope, current-version default, metadata filters, and (for GitHub search) owner/repository constraints.
+
+Examples:
+
+```bash
+curl 'http://127.0.0.1:8000/search?q=identity&domain=example.org&content_type=text/plain'
+curl 'http://127.0.0.1:8000/search?q=policy&retrieved_after=2026-01-01&retrieved_before=2026-12-31'
+curl 'http://127.0.0.1:8000/github/search?q=dependency&owner=example&content_type=text/*'
+```
