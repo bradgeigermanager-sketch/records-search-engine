@@ -662,3 +662,12 @@ def test_relationship_review_validation(client):
     assert client.post('/github/relationship-reviews', json={
         'from_source_id': 1, 'to_source_id': 2, 'decision': 'maybe'
     }).status_code == 422
+
+
+def test_github_relationship_explorer_page_is_available(client):
+    response = client.get('/github/explorer')
+    assert response.status_code == 200
+    assert 'GitHub Relationship Explorer' in response.text
+    assert '/github/relationship-candidates' in response.text
+    assert '/github/relationship-reviews' in response.text
+    assert '/github/relationship-graph' in response.text
