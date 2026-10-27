@@ -1071,9 +1071,9 @@ def _build_search_match(q: str, mode: str = "all", field: str = "both") -> str:
 
 def _search_explanation(q: str, title: str, body: str, mode: str, field: str) -> dict:
     """Return transparent, rule-based match evidence; this is not a probability."""
-    tokens = list(dict.fromkeys(re.findall(r"\\w+", q.casefold(), flags=re.UNICODE)))
-    title_tokens = re.findall(r"\\w+", (title or "").casefold(), flags=re.UNICODE)
-    body_tokens = re.findall(r"\\w+", (body or "").casefold(), flags=re.UNICODE)
+    tokens = list(dict.fromkeys(re.findall(r"\w+", q.casefold(), flags=re.UNICODE)))
+    title_tokens = re.findall(r"\w+", (title or "").casefold(), flags=re.UNICODE)
+    body_tokens = re.findall(r"\w+", (body or "").casefold(), flags=re.UNICODE)
     title_set, body_set = set(title_tokens), set(body_tokens)
     def matches(term: str, token_set: set[str]) -> bool:
         if mode == "prefix":
