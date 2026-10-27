@@ -350,3 +350,53 @@ def test_stem_knowledge_edge_validation_and_immutability(client):
             conn.execute('UPDATE knowledge_edges SET status=? WHERE id=?', ('supported', created['edge_id']))
         with pytest.raises(sqlite3.IntegrityError, match='immutable'):
             conn.execute('DELETE FROM knowledge_edges WHERE id=?', (created['edge_id'],))
+
+
+def test_stem_artifact_validation_reports_and_history(client):
+    page = client.post('/wiki/pages', json={
+        'slug': 'validation-lab', 'title': 'Validation lab', 'body': 'Validation examples.',
+        'discipline': 'physics'
+    }).json()
+    equation = client.post('/wiki/pages/validation-lab/artifacts', json={
+        'artifact_type': 'equation', 'name': 'Illustrative equation',
+        'data': {'expression': 'x = y', 'variables': [
+            {'symbol': 'x', 'meaning': 'position', 'unit': 'm'},
+            {'symbol': 'y', 'meaning': 'position estimate', 'unit': 'm'}
+        ]}
+    }).json()
+    report = client.post(f"/wiki/artifacts/{equation['artifact_id']}/validate")
+    assert report.status_code == 200
+    assert report.json()['outcome'] == 'review'
+    assert any('dimensional consistency was not evaluated' in w.lower() for w in report.json()['warnings'])
+    again = client.post(f"/wiki/artifacts/{equation['artifact_id']}/validate")
+    assert again.status_code == 200
+    history = client.get(f"/wiki/artifacts/{equation['artifact_id']}/validation-reports")
+    assert history.status_code == 200 and len(history.json()) == 2
+    with search_app.connection() as conn:
+        report_id = history.json()[0]['report_id']
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('UPDATE stem_validation_reports SET outcome=? WHERE id=?', ('pass', report_id))
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('DELETE FROM stem_validation_reports WHERE id=?', (report_id,))
+
+def test_stem_validator_detects_incomplete_experiment_and_unit_mismatch(client):
+    page = client.post('/wiki/pages', json={
+        'slug': 'validation-experiment', 'title': 'Experiment validation', 'body': 'Checks.',
+        'discipline': 'science'
+    }).json()
+    experiment = client.post('/wiki/pages/validation-experiment/artifacts', json={
+        'artifact_type': 'experiment', 'name': 'Incomplete experiment',
+        'data': {'procedure': [''], 'independent_variables': [], 'dependent_variables': []}
+    }).json()
+    report = client.post(f"/wiki/artifacts/{experiment['artifact_id']}/validate").json()
+    assert report['outcome'] == 'fail'
+    assert report['errors']
+
+    equation = client.post('/wiki/pages/validation-experiment/artifacts', json={
+        'artifact_type': 'equation', 'name': 'Declared unit comparison',
+        'data': {'expression': 'x = t', 'variables': [{'symbol': 'x', 'meaning': 'distance', 'unit': 'm'}],
+                 'lhs_unit': 'm', 'rhs_unit': 's'}
+    }).json()
+    unit_report = client.post(f"/wiki/artifacts/{equation['artifact_id']}/validate").json()
+    assert unit_report['outcome'] == 'fail'
+    assert any('dimensionally incompatible' in e for e in unit_report['errors'])
