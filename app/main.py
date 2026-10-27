@@ -1,9 +1,9 @@
 """Records Search Engine — source registry and immutable content versions."""
 from __future__ import annotations
-import hashlib, ipaddress, json, math, os, socket, sqlite3
+import base64, hashlib, ipaddress, json, math, os, socket, sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urldefrag, urlunparse
+from urllib.parse import urlparse, urldefrag, urlunparse, quote
 import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
@@ -14,11 +14,18 @@ APP_NAME = "Records Search Engine"
 DB_PATH = os.getenv("SEARCH_DB_PATH", "search.db")
 MAX_BYTES = 2_000_000
 TIMEOUT_SECONDS = 12
-USER_AGENT = "RecordsSearchEngine/0.9 (+responsible research; contact site operator before bulk use)"
-app = FastAPI(title=APP_NAME, version="0.9.0", description="Provenance-preserving web-record search prototype")
+USER_AGENT = "RecordsSearchEngine/0.10 (+responsible research; contact site operator before bulk use)"
+app = FastAPI(title=APP_NAME, version="0.10.0", description="Provenance-preserving web-record search prototype")
 
 class IngestRequest(BaseModel):
     url: HttpUrl
+
+class GitHubRepositoryIngestRequest(BaseModel):
+    owner: str
+    repository: str
+    ref: str | None = None
+    max_files: int = 50
+    include_extensions: list[str] = [".md", ".txt", ".rst", ".py", ".json", ".yaml", ".yml", ".toml", ".sql", ".html", ".xml", ".csv"]
 class EntityCreate(BaseModel):
     canonical_name: str
     entity_type: str
@@ -369,6 +376,90 @@ def save_document(url,title,body,status,content_type,provenance=None,extraction_
 
 @app.get("/health")
 def health(): return {"status":"ok","service":APP_NAME,"version":app.version}
+
+GITHUB_API = "https://api.github.com"
+GITHUB_FILE_LIMIT = 2_000_000
+
+def _github_headers():
+    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "RecordsSearchEngine/0.9"}
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+def _github_get_json(url: str):
+    response = httpx.get(url, headers=_github_headers(), timeout=TIMEOUT_SECONDS, follow_redirects=False)
+    if response.status_code in (401, 403):
+        raise HTTPException(status_code=502, detail="GitHub denied access. Check repository visibility, token permissions, or API rate limits.")
+    if response.status_code == 404:
+        raise HTTPException(status_code=404, detail="GitHub repository, ref, or file was not found or is not accessible to the configured token.")
+    response.raise_for_status()
+    return response.json()
+
+def _github_text_blob(blob_url: str):
+    payload = _github_get_json(blob_url)
+    if payload.get("encoding") != "base64" or not isinstance(payload.get("content"), str):
+        return None
+    try:
+        content = base64.b64decode(payload["content"], validate=False)
+        return content.decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+@app.post("/github/ingest-repository")
+def ingest_github_repository(request: GitHubRepositoryIngestRequest):
+    owner = request.owner.strip()
+    repository = request.repository.strip()
+    if not owner or not repository or any(x in owner + repository for x in ("/", "..", " ")) or not all(c.isalnum() or c in "-_" for c in owner + repository):
+        raise HTTPException(status_code=422, detail="owner and repository must be simple GitHub names, not paths or URLs")
+    if request.max_files < 1 or request.max_files > 100:
+        raise HTTPException(status_code=422, detail="max_files must be between 1 and 100")
+    extensions = {("." + x.lstrip(".")).lower() for x in request.include_extensions if x.strip()}
+    if not extensions or any(len(x) > 16 for x in extensions):
+        raise HTTPException(status_code=422, detail="include_extensions must contain valid short file extensions")
+    base = f"{GITHUB_API}/repos/{quote(owner, safe='')}/{quote(repository, safe='')}"
+    repo_info = _github_get_json(base)
+    ref = (request.ref or repo_info.get("default_branch") or "main").strip()
+    if not ref or len(ref) > 250:
+        raise HTTPException(status_code=422, detail="ref must be a non-empty branch, tag, or commit reference")
+    tree = _github_get_json(f"{base}/git/trees/{quote(ref, safe='')}" + "?recursive=1")
+    if tree.get("truncated"):
+        raise HTTPException(status_code=413, detail="GitHub returned a truncated repository tree; narrow the ref or use smaller repositories")
+    candidates = []
+    skipped = {"binary_or_unsupported_extension": 0, "too_large": 0}
+    for item in tree.get("tree", []):
+        if item.get("type") != "blob":
+            continue
+        path = item.get("path", "")
+        if not path or path.startswith("/") or any(part in (".git", "node_modules", "vendor", "__pycache__", ".venv") for part in path.split("/")):
+            continue
+        if os.path.splitext(path)[1].lower() not in extensions:
+            skipped["binary_or_unsupported_extension"] += 1
+            continue
+        if item.get("size", 0) > GITHUB_FILE_LIMIT:
+            skipped["too_large"] += 1
+            continue
+        candidates.append(item)
+    candidates.sort(key=lambda item: item["path"].lower())
+    selected = candidates[:request.max_files]
+    indexed, failed = [], []
+    for item in selected:
+        try:
+            body = _github_text_blob(f"{base}/git/blobs/{quote(item['sha'], safe='')}")
+            if body is None:
+                skipped["binary_or_unsupported_extension"] += 1
+                continue
+            if len(body.encode("utf-8")) > GITHUB_FILE_LIMIT:
+                skipped["too_large"] += 1
+                continue
+            path = item["path"]
+            file_url = f"https://github.com/{owner}/{repository}/blob/{quote(ref, safe='/')}/{quote(path, safe='/')}"
+            provenance = {"method": "github_repository_ingestion", "owner": owner, "repository": repository, "ref": ref, "git_blob_sha": item["sha"], "path": path, "repository_url": repo_info.get("html_url"), "private_repository": bool(repo_info.get("private")), "api_endpoint": f"{base}/git/blobs/{item['sha']}"}
+            saved = save_document(file_url, f"{owner}/{repository}: {path}", body, 200, "text/plain; charset=utf-8", provenance)
+            indexed.append({**saved, "path": path, "characters_indexed": len(body)})
+        except (httpx.HTTPError, ValueError, UnicodeDecodeError) as exc:
+            failed.append({"path": item.get("path"), "reason": type(exc).__name__})
+    return {"status": "completed", "owner": owner, "repository": repository, "ref": ref, "private_repository": bool(repo_info.get("private")), "files_considered": len(selected), "files_available": len(candidates), "files_indexed": len(indexed), "files_failed": failed, "skipped": skipped, "results": indexed, "note": "Files are indexed as immutable document versions; unchanged file content does not create a duplicate version. Configure GITHUB_TOKEN through the deployment environment for private repositories."}
 
 @app.post("/ingest")
 def ingest(request:IngestRequest):
