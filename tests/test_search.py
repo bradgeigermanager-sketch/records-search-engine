@@ -504,3 +504,66 @@ def test_github_owner_ingestion_scans_bounded_repository_list(client, monkeypatc
 def test_github_owner_ingestion_bounds_request(client):
     assert client.post('/github/ingest-owner', json={'owner': '../bad'}).status_code == 422
     assert client.post('/github/ingest-owner', json={'owner': 'owner', 'max_repositories': 21}).status_code == 422
+
+
+def test_github_owner_search_and_source_navigation(client):
+    first = search_app.save_document(
+        'https://github.com/example-owner/process-a/blob/main/README.md',
+        'example-owner/process-a: README.md',
+        'Canonical process library describes evidence provenance and repeatable records.',
+        200, 'text/plain; charset=utf-8',
+        {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'process-a',
+         'ref': 'main', 'path': 'README.md', 'repository_url': 'https://github.com/example-owner/process-a'})
+    second = search_app.save_document(
+        'https://github.com/example-owner/process-b/blob/main/guide.md',
+        'example-owner/process-b: guide.md',
+        'Cross repository records connect shared entities and source provenance.',
+        200, 'text/plain; charset=utf-8',
+        {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'process-b',
+         'ref': 'main', 'path': 'guide.md', 'repository_url': 'https://github.com/example-owner/process-b'})
+    search = client.get('/github/search', params={'q': 'source provenance', 'owner': 'example-owner'})
+    assert search.status_code == 200
+    assert {item['repository'] for item in search.json()} == {'process-a', 'process-b'}
+    assert all(item['source_navigation'].startswith('/sources/') for item in search.json())
+    filtered = client.get('/github/search', params={'q': 'source provenance', 'owner': 'example-owner', 'repository': 'process-b'})
+    assert len(filtered.json()) == 1
+    assert filtered.json()[0]['source_id'] == second['source_id']
+    repositories = client.get('/github/repositories', params={'owner': 'example-owner'}).json()
+    assert {item['repository'] for item in repositories} == {'process-a', 'process-b'}
+    files = client.get('/github/repositories/example-owner/process-a').json()
+    assert len(files) == 1 and files[0]['path'] == 'README.md'
+    assert files[0]['source_id'] == first['source_id']
+    assert files[0]['history_navigation'] == f"/sources/{first['source_id']}/versions"
+
+
+def test_cross_repository_relationships_are_explicit_and_immutable(client):
+    first = search_app.save_document(
+        'https://github.com/example-owner/process-a/blob/main/README.md', 'process-a README',
+        'Defines the process interface.', 200, 'text/plain',
+        {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'process-a', 'path': 'README.md'})
+    second = search_app.save_document(
+        'https://github.com/example-owner/process-b/blob/main/README.md', 'process-b README',
+        'Implements the process interface.', 200, 'text/plain',
+        {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'process-b', 'path': 'README.md'})
+    created = client.post('/github/repository-relationships', json={
+        'from_source_id': first['source_id'], 'to_source_id': second['source_id'],
+        'predicate': 'implements', 'confidence': 0.85, 'status': 'proposed',
+        'provenance': {'basis': 'manual review'}
+    })
+    assert created.status_code == 200
+    relationship = created.json()
+    assert relationship['predicate'] == 'implements'
+    listed = client.get('/github/repository-relationships', params={'owner': 'example-owner'}).json()
+    assert len(listed) == 1
+    assert listed[0]['from_provenance']['repository'] == 'process-a'
+    assert listed[0]['to_provenance']['repository'] == 'process-b'
+    same_repo = client.post('/github/repository-relationships', json={
+        'from_source_id': first['source_id'], 'to_source_id': first['source_id'],
+        'predicate': 'duplicates'
+    })
+    assert same_repo.status_code == 422
+    with search_app.connection() as conn:
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('UPDATE repository_relationships SET status=? WHERE id=?', ('supported', relationship['relationship_id']))
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('DELETE FROM repository_relationships WHERE id=?', (relationship['relationship_id'],))
