@@ -60,6 +60,20 @@ curl 'http://127.0.0.1:8000/sources'
 curl 'http://127.0.0.1:8000/documents?include_history=true'
 ```
 
+
+## Owner-wide GitHub search and cross-repository navigation
+
+After indexing repositories with `POST /github/ingest-owner`, use:
+
+- `GET /github/search?q=provenance&owner=YOUR_OWNER` to search indexed GitHub files across repositories.
+- Add `repository=REPO_NAME` to narrow results, or `include_history=true` to search older file versions.
+- `GET /github/repositories?owner=YOUR_OWNER` to list indexed repositories, indexed-file counts, and navigation links.
+- `GET /github/repositories/OWNER/REPOSITORY` to browse indexed files with GitHub file URLs and local source/version-history links.
+- `POST /github/repository-relationships` to record an explicit cross-repository relationship between two indexed file sources. Body fields: `from_source_id`, `to_source_id`, `predicate`, and optional `confidence`, `status`, `provenance`.
+- `GET /github/repository-relationships?owner=YOUR_OWNER` to list those relationships with both endpoints' URLs and ingestion provenance.
+
+Cross-repository relationships are **explicit assertions**, not automatically inferred facts. They are append-only and immutable; use statuses `proposed`, `supported`, `disputed`, or `rejected` to preserve review state without silently rewriting history. Search and browse results expose local source and version-history navigation so a result can be traced back to its indexed file.
+
 ## GitHub repository ingestion
 `POST /github/ingest-repository` reads a bounded set of text files from a repository tree. By default it includes Markdown, plain text, source code, JSON/YAML, SQL, HTML/XML, TOML, and CSV files; binary files, unsupported extensions, common dependency/build directories, and files over 2 MB are skipped. `max_files` is limited to 100 per request. Each indexed file is stored through the existing immutable document-version pipeline, with repository, ref, path, Git blob SHA, and source URL in provenance. Re-ingesting unchanged content does not create a duplicate document version. Set `GITHUB_TOKEN` in the deployment environment to access private repositories allowed by that token; never send the token in request JSON. This first iteration is manually triggered, not an unattended full-account crawler.
 
