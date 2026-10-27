@@ -238,21 +238,50 @@ def ingest(request:IngestRequest):
         return {"status":"indexed",**saved,"characters_indexed":len(body)}
     except (ValueError,httpx.HTTPError) as exc: raise HTTPException(status_code=400,detail=str(exc)) from exc
 
+def _metadata_filter_sql(metadata_key: str | None, metadata_value: str | None, alias: str = "s"):
+    """Return a parameterized EXISTS clause for the current value of source metadata."""
+    if metadata_value is not None and not metadata_key:
+        raise HTTPException(status_code=422, detail="metadata_key is required when metadata_value is supplied")
+    if not metadata_key:
+        return "", []
+    clauses = [
+        f"""EXISTS (
+            SELECT 1 FROM source_metadata sm
+            WHERE sm.source_id={alias}.id AND sm.metadata_key=?
+              AND sm.id=(SELECT sm2.id FROM source_metadata sm2
+                         WHERE sm2.source_id={alias}.id AND sm2.metadata_key=sm.metadata_key
+                         ORDER BY sm2.created_at DESC, sm2.id DESC LIMIT 1)"""
+    ]
+    params = [metadata_key.strip()]
+    if metadata_value is not None:
+        clauses[0] += " AND sm.value_json=?"
+        params.append(json.dumps(metadata_value, ensure_ascii=False))
+    clauses[0] += ")"
+    return " AND " + clauses[0], params
+
 @app.get("/search",response_model=list[SearchResult])
-def search(q:str=Query(min_length=1,max_length=300),limit:int=Query(default=10,ge=1,le=50),include_history:bool=False):
+def search(q:str=Query(min_length=1,max_length=300),limit:int=Query(default=10,ge=1,le=50),
+           include_history:bool=False,metadata_key:str|None=None,metadata_value:str|None=None):
     terms=[t.replace('"',' ').strip() for t in q.split() if t.strip()]
     if not terms: return []
     match=' AND '.join('"'+t.replace('"','')+'"' for t in terms)
     filter_sql='' if include_history else 'AND s.current_version_id=v.id'
+    metadata_sql, metadata_params = _metadata_filter_sql(metadata_key, metadata_value)
     with connection() as conn:
-        rows=conn.execute(f"""SELECT v.id,v.source_id,v.version_number,v.title,s.canonical_url,v.body,v.retrieved_at,v.content_hash,s.current_version_id,snippet(versions_fts,1,'<mark>','</mark>',' … ',24) excerpt FROM versions_fts JOIN document_versions v ON v.id=versions_fts.rowid JOIN sources s ON s.id=v.source_id WHERE versions_fts MATCH ? {filter_sql} ORDER BY bm25(versions_fts),v.retrieved_at DESC LIMIT ?""",(match,limit)).fetchall()
+        rows=conn.execute(f"""SELECT v.id,v.source_id,v.version_number,v.title,s.canonical_url,v.body,v.retrieved_at,v.content_hash,s.current_version_id,snippet(versions_fts,1,'<mark>','</mark>',' … ',24) excerpt FROM versions_fts JOIN document_versions v ON v.id=versions_fts.rowid JOIN sources s ON s.id=v.source_id WHERE versions_fts MATCH ? {filter_sql} {metadata_sql} ORDER BY bm25(versions_fts),v.retrieved_at DESC LIMIT ?""",(match,*metadata_params,limit)).fetchall()
     return [SearchResult(document_id=r["id"],version_id=r["id"],source_id=r["source_id"],version_number=r["version_number"],title=r["title"],url=r["canonical_url"],excerpt=r["excerpt"] or r["body"][:240],retrieved_at=r["retrieved_at"],content_hash=r["content_hash"],is_current=r["current_version_id"]==r["id"]) for r in rows]
 
 @app.get("/documents")
-def documents(limit:int=Query(default=20,ge=1,le=100),include_history:bool=False):
+def documents(limit:int=Query(default=20,ge=1,le=100),include_history:bool=False,
+              metadata_key:str|None=None,metadata_value:str|None=None):
     filt='' if include_history else 'WHERE s.current_version_id=v.id'
+    metadata_sql, metadata_params = _metadata_filter_sql(metadata_key, metadata_value)
+    if filt:
+        filt += metadata_sql
+    else:
+        filt = "WHERE 1=1" + metadata_sql
     with connection() as conn:
-        rows=conn.execute(f"SELECT v.id version_id,s.id source_id,v.version_number,s.canonical_url url,v.title,v.retrieved_at,v.content_hash,v.extraction_status,v.http_status,v.content_type,(s.current_version_id=v.id) is_current FROM document_versions v JOIN sources s ON s.id=v.source_id {filt} ORDER BY v.retrieved_at DESC LIMIT ?",(limit,)).fetchall()
+        rows=conn.execute(f"SELECT v.id version_id,s.id source_id,v.version_number,s.canonical_url url,v.title,v.retrieved_at,v.content_hash,v.extraction_status,v.http_status,v.content_type,(s.current_version_id=v.id) is_current FROM document_versions v JOIN sources s ON s.id=v.source_id {filt} ORDER BY v.retrieved_at DESC LIMIT ?",(*metadata_params,limit)).fetchall()
     return [dict(r) for r in rows]
 
 @app.get("/sources")
