@@ -475,3 +475,32 @@ def test_github_repository_ingestion_validates_request_and_tree_size(client, mon
     monkeypatch.setattr(search_app, '_github_get_json', fake_get_json)
     response = client.post('/github/ingest-repository', json={'owner': 'example-owner', 'repository': 'large-repo'})
     assert response.status_code == 413
+
+
+def test_github_owner_ingestion_scans_bounded_repository_list(client, monkeypatch):
+    def fake_get_json(url):
+        if url.endswith('/users/example-owner/repos?type=owner&per_page=100&sort=updated'):
+            return [
+                {'name': 'repo-one', 'private': False, 'fork': False, 'archived': False},
+                {'name': 'repo-two', 'private': False, 'fork': False, 'archived': False},
+                {'name': 'forked-repo', 'private': False, 'fork': True, 'archived': False}
+            ]
+        if url.endswith('/repos/example-owner/repo-one') or url.endswith('/repos/example-owner/repo-two'):
+            name = 'repo-one' if 'repo-one' in url else 'repo-two'
+            return {'default_branch': 'main', 'private': False, 'html_url': 'https://github.com/example-owner/' + name}
+        if '/git/trees/' in url:
+            name = 'repo-one' if 'repo-one' in url else 'repo-two'
+            return {'truncated': False, 'tree': [{'type': 'blob', 'path': 'README.md', 'sha': 'blob-' + name, 'size': 40}]}
+        raise AssertionError('unexpected GitHub API URL: ' + url)
+
+    monkeypatch.setattr(search_app, '_github_get_json', fake_get_json)
+    monkeypatch.setattr(search_app, '_github_text_blob', lambda url: 'Documentation from ' + ('repo-one' if 'blob-repo-one' in url else 'repo-two'))
+    response = client.post('/github/ingest-owner', json={'owner': 'example-owner', 'max_repositories': 10, 'max_files_per_repository': 5})
+    assert response.status_code == 200
+    assert response.json()['repositories_considered'] == 2
+    assert response.json()['repositories_indexed'] == 2
+    assert {item['repository'] for item in response.json()['results']} == {'repo-one', 'repo-two'}
+
+def test_github_owner_ingestion_bounds_request(client):
+    assert client.post('/github/ingest-owner', json={'owner': '../bad'}).status_code == 422
+    assert client.post('/github/ingest-owner', json={'owner': 'owner', 'max_repositories': 21}).status_code == 422
