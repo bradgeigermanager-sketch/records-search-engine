@@ -15,7 +15,7 @@ DB_PATH = os.getenv("SEARCH_DB_PATH", "search.db")
 MAX_BYTES = 2_000_000
 TIMEOUT_SECONDS = 12
 USER_AGENT = "RecordsSearchEngine/0.11 (+responsible research; contact site operator before bulk use)"
-app = FastAPI(title=APP_NAME, version="0.11.0", description="Provenance-preserving web-record search prototype")
+app = FastAPI(title=APP_NAME, version="0.12.0", description="Provenance-preserving web-record search prototype")
 
 class IngestRequest(BaseModel):
     url: HttpUrl
@@ -51,6 +51,14 @@ class RelationshipCreate(BaseModel):
     source_id: int | None = None
     evidence_version_id: int | None = None
     confidence: float | None = None
+    provenance: dict = {}
+
+class RepositoryRelationshipCreate(BaseModel):
+    from_source_id: int
+    to_source_id: int
+    predicate: str
+    confidence: float | None = None
+    status: str = "proposed"
     provenance: dict = {}
 
 class WikiPageCreate(BaseModel):
@@ -332,6 +340,26 @@ def init_db():
                 ("stem-core","0.2",json.dumps({"equation":["expression_required","variables_defined","coarse_dimensional_check"],"constant":["value_finite","unit_required","source_review","uncertainty_review"],"algorithm":["pseudocode_required","interface_review","preconditions_review","complexity_review"],"experiment":["procedure_complete","variables_defined","controls_review","replication_review","uncertainty_review","safety_review"]}, sort_keys=True),utc_now()))
             conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(7,?)", (utc_now(),))
 
+        if 8 not in applied:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS repository_relationships (
+                id INTEGER PRIMARY KEY,
+                from_source_id INTEGER NOT NULL REFERENCES sources(id),
+                to_source_id INTEGER NOT NULL REFERENCES sources(id),
+                predicate TEXT NOT NULL,
+                confidence REAL CHECK(confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+                status TEXT NOT NULL DEFAULT 'proposed' CHECK(status IN ('proposed','supported','disputed','rejected')),
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                CHECK(from_source_id <> to_source_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_repo_relationship_from ON repository_relationships(from_source_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_repo_relationship_to ON repository_relationships(to_source_id, created_at DESC);
+            CREATE TRIGGER IF NOT EXISTS repository_relationships_no_update BEFORE UPDATE ON repository_relationships BEGIN SELECT RAISE(ABORT,'repository relationships are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS repository_relationships_no_delete BEFORE DELETE ON repository_relationships BEGIN SELECT RAISE(ABORT,'repository relationships are immutable'); END;
+            """)
+            conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(8,?)", (utc_now(),))
+
 @app.on_event("startup")
 def startup():
     init_db()
@@ -492,6 +520,154 @@ def ingest_github_repository(request: GitHubRepositoryIngestRequest):
         except (httpx.HTTPError, ValueError, UnicodeDecodeError) as exc:
             failed.append({"path": item.get("path"), "reason": type(exc).__name__})
     return {"status": "completed", "owner": owner, "repository": repository, "ref": ref, "private_repository": bool(repo_info.get("private")), "files_considered": len(selected), "files_available": len(candidates), "files_indexed": len(indexed), "files_failed": failed, "skipped": skipped, "results": indexed, "note": "Files are indexed as immutable document versions; unchanged file content does not create a duplicate version. Configure GITHUB_TOKEN through the deployment environment for private repositories."}
+
+
+@app.get("/github/search")
+def github_search(q: str = Query(min_length=1, max_length=300),
+                  owner: str | None = None, repository: str | None = None,
+                  limit: int = Query(default=20, ge=1, le=100),
+                  include_history: bool = False):
+    """Search indexed GitHub files with repository and source-navigation metadata."""
+    terms = [term.replace('"', ' ').strip() for term in q.split() if term.strip()]
+    if not terms:
+        return []
+    match = " AND ".join('"' + term.replace('"', '') + '"' for term in terms)
+    clauses, params = ["versions_fts MATCH ?", "json_extract(v.provenance_json,'$.method')='github_repository_ingestion'"], [match]
+    if not include_history:
+        clauses.append("s.current_version_id=v.id")
+    if owner:
+        clauses.append("lower(json_extract(v.provenance_json,'$.owner'))=lower(?)")
+        params.append(owner.strip())
+    if repository:
+        clauses.append("lower(json_extract(v.provenance_json,'$.repository'))=lower(?)")
+        params.append(repository.strip())
+    params.append(limit)
+    with connection() as conn:
+        rows = conn.execute("""SELECT v.id version_id,v.source_id,v.version_number,v.title,s.canonical_url url,
+            v.body,v.retrieved_at,v.content_hash,s.current_version_id,
+            json_extract(v.provenance_json,'$.owner') owner,
+            json_extract(v.provenance_json,'$.repository') repository,
+            json_extract(v.provenance_json,'$.ref') ref,
+            json_extract(v.provenance_json,'$.path') path,
+            json_extract(v.provenance_json,'$.repository_url') repository_url,
+            snippet(versions_fts,1,'<mark>','</mark>',' … ',24) excerpt
+            FROM versions_fts JOIN document_versions v ON v.id=versions_fts.rowid
+            JOIN sources s ON s.id=v.source_id WHERE """ + " AND ".join(clauses) +
+            " ORDER BY bm25(versions_fts),v.retrieved_at DESC LIMIT ?", params).fetchall()
+    return [{"source_id": r["source_id"], "version_id": r["version_id"], "version_number": r["version_number"],
+             "title": r["title"], "url": r["url"], "excerpt": r["excerpt"] or r["body"][:240],
+             "retrieved_at": r["retrieved_at"], "content_hash": r["content_hash"],
+             "is_current": r["current_version_id"] == r["version_id"], "owner": r["owner"],
+             "repository": r["repository"], "ref": r["ref"], "path": r["path"],
+             "repository_url": r["repository_url"], "file_url": r["url"],
+             "source_navigation": f"/sources/{r['source_id']}",
+             "history_navigation": f"/sources/{r['source_id']}/versions"} for r in rows]
+
+
+@app.get("/github/repositories")
+def github_repositories(owner: str | None = None, limit: int = Query(default=100, ge=1, le=500)):
+    """List indexed GitHub repositories with file counts and last-indexed times."""
+    clauses = ["json_extract(s.provenance_json,'$.method')='github_repository_ingestion'"]
+    params = []
+    if owner:
+        clauses.append("lower(json_extract(s.provenance_json,'$.owner'))=lower(?)")
+        params.append(owner.strip())
+    with connection() as conn:
+        rows = conn.execute("""SELECT json_extract(s.provenance_json,'$.owner') owner,
+            json_extract(s.provenance_json,'$.repository') repository,
+            json_extract(s.provenance_json,'$.repository_url') repository_url,
+            COUNT(DISTINCT s.id) file_count, MAX(s.last_seen_at) last_indexed_at,
+            SUM(CASE WHEN s.current_version_id IS NOT NULL THEN 1 ELSE 0 END) current_file_count
+            FROM sources s WHERE """ + " AND ".join(clauses) +
+            " GROUP BY owner,repository,repository_url ORDER BY last_indexed_at DESC LIMIT ?", (*params, limit)).fetchall()
+    return [{"owner": r["owner"], "repository": r["repository"], "repository_url": r["repository_url"],
+             "file_count": r["file_count"], "current_file_count": r["current_file_count"],
+             "last_indexed_at": r["last_indexed_at"],
+             "files_navigation": f"/github/repositories/{quote(str(r['owner']), safe='')}/{quote(str(r['repository']), safe='')}"} for r in rows]
+
+
+@app.get("/github/repositories/{owner}/{repository}")
+def github_repository_files(owner: str, repository: str,
+                            limit: int = Query(default=100, ge=1, le=500),
+                            include_history: bool = False):
+    """Browse indexed files in one repository, with source/version navigation."""
+    clauses = ["json_extract(s.provenance_json,'$.method')='github_repository_ingestion'",
+               "lower(json_extract(s.provenance_json,'$.owner'))=lower(?)",
+               "lower(json_extract(s.provenance_json,'$.repository'))=lower(?)"]
+    params = [owner, repository]
+    if not include_history:
+        clauses.append("s.current_version_id=v.id")
+    params.append(limit)
+    with connection() as conn:
+        rows = conn.execute("""SELECT s.id source_id,v.id version_id,v.version_number,v.title,
+            s.canonical_url file_url,json_extract(v.provenance_json,'$.ref') ref,
+            json_extract(v.provenance_json,'$.path') path,v.content_hash,v.retrieved_at,
+            (s.current_version_id=v.id) is_current
+            FROM sources s JOIN document_versions v ON v.source_id=s.id
+            WHERE """ + " AND ".join(clauses) + " ORDER BY path, v.version_number DESC LIMIT ?", params).fetchall()
+    return [{"source_id": r["source_id"], "version_id": r["version_id"], "version_number": r["version_number"],
+             "title": r["title"], "file_url": r["file_url"], "ref": r["ref"], "path": r["path"],
+             "content_hash": r["content_hash"], "retrieved_at": r["retrieved_at"], "is_current": bool(r["is_current"]),
+             "source_navigation": f"/sources/{r['source_id']}",
+             "history_navigation": f"/sources/{r['source_id']}/versions"} for r in rows]
+
+
+@app.post("/github/repository-relationships")
+def create_github_repository_relationship(request: RepositoryRelationshipCreate):
+    """Record an explicit, provenance-linked relation between files in different repositories."""
+    predicate = request.predicate.strip()
+    if not predicate or len(predicate) > 200:
+        raise HTTPException(status_code=422, detail="predicate must contain 1 to 200 characters")
+    if request.status not in {"proposed", "supported", "disputed", "rejected"}:
+        raise HTTPException(status_code=422, detail="status must be proposed, supported, disputed, or rejected")
+    if request.confidence is not None and not 0 <= request.confidence <= 1:
+        raise HTTPException(status_code=422, detail="confidence must be between 0 and 1")
+    now = utc_now()
+    with connection() as conn:
+        rows = conn.execute("SELECT id,provenance_json FROM sources WHERE id IN (?,?)",
+                            (request.from_source_id, request.to_source_id)).fetchall()
+        if len(rows) != 2:
+            raise HTTPException(status_code=404, detail="Both source IDs must exist and be different")
+        provenance = {r["id"]: json.loads(r["provenance_json"]) for r in rows}
+        left, right = provenance[request.from_source_id], provenance[request.to_source_id]
+        if left.get("method") != "github_repository_ingestion" or right.get("method") != "github_repository_ingestion":
+            raise HTTPException(status_code=422, detail="Both sources must be indexed GitHub repository files")
+        if (left.get("owner", "").lower(), left.get("repository", "").lower()) == (right.get("owner", "").lower(), right.get("repository", "").lower()):
+            raise HTTPException(status_code=422, detail="Cross-repository relationships must connect different repositories")
+        cur = conn.execute("""INSERT INTO repository_relationships(from_source_id,to_source_id,predicate,confidence,status,provenance_json,created_at)
+            VALUES(?,?,?,?,?,?,?)""", (request.from_source_id, request.to_source_id, predicate, request.confidence,
+            request.status, json.dumps(request.provenance, ensure_ascii=False, sort_keys=True), now))
+        relationship_id = cur.lastrowid
+    return {"relationship_id": relationship_id, "from_source_id": request.from_source_id,
+            "to_source_id": request.to_source_id, "predicate": predicate, "confidence": request.confidence,
+            "status": request.status, "provenance": request.provenance, "created_at": now}
+
+
+@app.get("/github/repository-relationships")
+def list_github_repository_relationships(owner: str | None = None, repository: str | None = None,
+                                         limit: int = Query(default=100, ge=1, le=500)):
+    """List explicit cross-repository links with both file endpoints and evidence provenance."""
+    clauses = ["1=1"]
+    params = []
+    if owner:
+        clauses.append("(lower(json_extract(fs.provenance_json,'$.owner'))=lower(?) OR lower(json_extract(ts.provenance_json,'$.owner'))=lower(?))")
+        params.extend([owner.strip(), owner.strip()])
+    if repository:
+        clauses.append("(lower(json_extract(fs.provenance_json,'$.repository'))=lower(?) OR lower(json_extract(ts.provenance_json,'$.repository'))=lower(?))")
+        params.extend([repository.strip(), repository.strip()])
+    params.append(limit)
+    with connection() as conn:
+        rows = conn.execute("""SELECT rr.*,fs.canonical_url from_url,ts.canonical_url to_url,
+            fs.provenance_json from_provenance_json,ts.provenance_json to_provenance_json
+            FROM repository_relationships rr JOIN sources fs ON fs.id=rr.from_source_id
+            JOIN sources ts ON ts.id=rr.to_source_id WHERE """ + " AND ".join(clauses) +
+            " ORDER BY rr.created_at DESC,rr.id DESC LIMIT ?", params).fetchall()
+    return [{"relationship_id": r["id"], "from_source_id": r["from_source_id"], "to_source_id": r["to_source_id"],
+             "from_url": r["from_url"], "to_url": r["to_url"],
+             "from_provenance": json.loads(r["from_provenance_json"]), "to_provenance": json.loads(r["to_provenance_json"]),
+             "predicate": r["predicate"], "confidence": r["confidence"], "status": r["status"],
+             "provenance": json.loads(r["provenance_json"]), "created_at": r["created_at"]} for r in rows]
+
 
 @app.post("/ingest")
 def ingest(request:IngestRequest):
