@@ -632,12 +632,13 @@ def ingest_github_repository(request: GitHubRepositoryIngestRequest):
 def github_search(q: str = Query(min_length=1, max_length=300),
                   owner: str | None = None, repository: str | None = None,
                   limit: int = Query(default=20, ge=1, le=100),
-                  include_history: bool = False):
-    """Search indexed GitHub files with repository and source-navigation metadata."""
-    terms = [term.replace('"', ' ').strip() for term in q.split() if term.strip()]
-    if not terms:
+                  include_history: bool = False,
+                  mode: str = Query(default="all", pattern="^(all|any|phrase|prefix)$"),
+                  field: str = Query(default="both", pattern="^(both|title|body)$")):
+    """Search indexed GitHub files with configurable matching and title/body scope."""
+    match = _build_search_match(q, mode, field)
+    if not match:
         return []
-    match = " AND ".join('"' + term.replace('"', '') + '"' for term in terms)
     clauses, params = ["versions_fts MATCH ?", "json_extract(v.provenance_json,'$.method')='github_repository_ingestion'"], [match]
     if not include_history:
         clauses.append("s.current_version_id=v.id")
@@ -1041,12 +1042,33 @@ def _metadata_filter_sql(metadata_key: str | None, metadata_value: str | None, a
     clauses[0] += ")"
     return " AND " + clauses[0], params
 
+def _build_search_match(q: str, mode: str = "all", field: str = "both") -> str:
+    """Build a bounded FTS5 expression from plain-text terms."""
+    terms = [term.strip() for term in q.split() if term.strip()]
+    if not terms:
+        return ""
+    quoted = ['"' + term.replace('"', '""') + '"' for term in terms]
+    if mode == "phrase":
+        expression = '"' + " ".join(terms).replace('"', '""') + '"'
+    elif mode == "any":
+        expression = " OR ".join(quoted)
+    elif mode == "prefix":
+        expression = " AND ".join(token + "*" for token in quoted)
+    else:
+        expression = " AND ".join(quoted)
+    if field == "title":
+        return "title : (" + expression + ")"
+    if field == "body":
+        return "body : (" + expression + ")"
+    return expression
+
 @app.get("/search",response_model=list[SearchResult])
 def search(q:str=Query(min_length=1,max_length=300),limit:int=Query(default=10,ge=1,le=50),
-           include_history:bool=False,metadata_key:str|None=None,metadata_value:str|None=None):
-    terms=[t.replace('"',' ').strip() for t in q.split() if t.strip()]
-    if not terms: return []
-    match=' AND '.join('"'+t.replace('"','')+'"' for t in terms)
+           include_history:bool=False,metadata_key:str|None=None,metadata_value:str|None=None,
+           mode:str=Query(default="all",pattern="^(all|any|phrase|prefix)$"),
+           field:str=Query(default="both",pattern="^(both|title|body)$")):
+    match = _build_search_match(q, mode, field)
+    if not match: return []
     filter_sql='' if include_history else 'AND s.current_version_id=v.id'
     metadata_sql, metadata_params = _metadata_filter_sql(metadata_key, metadata_value)
     with connection() as conn:
