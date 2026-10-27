@@ -637,12 +637,17 @@ def github_search(q: str = Query(min_length=1, max_length=300),
                   limit: int = Query(default=20, ge=1, le=100),
                   include_history: bool = False,
                   mode: str = Query(default="all", pattern="^(all|any|phrase|prefix)$"),
-                  field: str = Query(default="both", pattern="^(both|title|body)$")):
-    """Search indexed GitHub files with configurable matching and title/body scope."""
+                  field: str = Query(default="both", pattern="^(both|title|body)$"),
+                  domain: str | None = None, content_type: str | None = None,
+                  retrieved_after: str | None = None, retrieved_before: str | None = None):
+    """Search indexed GitHub files with matching, field scope, and source/date filters."""
     match = _build_search_match(q, mode, field)
     if not match:
         return []
     clauses, params = ["versions_fts MATCH ?", "json_extract(v.provenance_json,'$.method')='github_repository_ingestion'"], [match]
+    facet_clauses, facet_params = _search_facet_filters(domain, content_type, retrieved_after, retrieved_before)
+    clauses.extend(facet_clauses)
+    params.extend(facet_params)
     if not include_history:
         clauses.append("s.current_version_id=v.id")
     if owner:
@@ -1111,17 +1116,78 @@ def _search_explanation(q: str, title: str, body: str, mode: str, field: str) ->
         + (10.0 if any(reason.startswith("exact phrase") for reason in reasons) else 0.0), 2))
     return {"matched_terms": matched, "match_reasons": reasons, "relevance_score": score}
 
+def _search_facet_filters(domain: str | None, content_type: str | None,
+                            retrieved_after: str | None, retrieved_before: str | None,
+                            source_alias: str = "s", version_alias: str = "v") -> tuple[list[str], list[str]]:
+    """Build parameterized exact-domain, content-type-prefix, and retrieval-date filters."""
+    clauses: list[str] = []
+    params: list[str] = []
+    if domain:
+        candidate = domain.strip().lower()
+        parsed = urlparse(candidate if "://" in candidate else "//" + candidate)
+        host = (parsed.hostname or "").lower()
+        if parsed.path not in ("", "/") or parsed.query or parsed.fragment or parsed.username or parsed.password:
+            raise HTTPException(status_code=422, detail="domain must be a hostname, optionally prefixed by http:// or https://")
+        if not host or not re.fullmatch(r"[a-z0-9.-]+", host):
+            raise HTTPException(status_code=422, detail="domain must be a valid hostname")
+        clauses.append(f"(lower({source_alias}.canonical_url) LIKE ? OR lower({source_alias}.canonical_url) LIKE ?)")
+        params.extend([f"http://{host}/%", f"https://{host}/%"])
+    if content_type:
+        content_filter = content_type.strip().lower()
+        if not content_filter or not re.fullmatch(r"[a-z0-9.+-]+/[a-z0-9.+*/-]+", content_filter):
+            raise HTTPException(status_code=422, detail="content_type must be a media type such as text/plain or application/*")
+        if "*" in content_filter and not content_filter.endswith("/*"):
+            raise HTTPException(status_code=422, detail="content_type wildcard is only supported as a trailing /*")
+        if content_filter.endswith("/*"):
+            clauses.append(f"lower({version_alias}.content_type) LIKE ?")
+            params.append(content_filter[:-1] + "%")
+        else:
+            clauses.append(f"lower({version_alias}.content_type) LIKE ?")
+            params.append(content_filter + "%")
+    def normalize_datetime(value: str | None, parameter: str) -> str | None:
+        if value is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"{parameter} must be an ISO 8601 date or datetime") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
+    after = normalize_datetime(retrieved_after, "retrieved_after")
+    before = normalize_datetime(retrieved_before, "retrieved_before")
+    if after and before and after > before:
+        raise HTTPException(status_code=422, detail="retrieved_after must be earlier than or equal to retrieved_before")
+    if after:
+        clauses.append(f"{version_alias}.retrieved_at >= ?")
+        params.append(after)
+    if before:
+        clauses.append(f"{version_alias}.retrieved_at <= ?")
+        params.append(before)
+    return clauses, params
+
 @app.get("/search",response_model=list[SearchResult])
 def search(q:str=Query(min_length=1,max_length=300),limit:int=Query(default=10,ge=1,le=50),
            include_history:bool=False,metadata_key:str|None=None,metadata_value:str|None=None,
            mode:str=Query(default="all",pattern="^(all|any|phrase|prefix)$"),
-           field:str=Query(default="both",pattern="^(both|title|body)$")):
+           field:str=Query(default="both",pattern="^(both|title|body)$"),
+           domain:str|None=None,content_type:str|None=None,
+           retrieved_after:str|None=None,retrieved_before:str|None=None):
     match = _build_search_match(q, mode, field)
     if not match: return []
-    filter_sql='' if include_history else 'AND s.current_version_id=v.id'
+    clauses = ["versions_fts MATCH ?"]
+    params = [match]
+    if not include_history:
+        clauses.append("s.current_version_id=v.id")
+    facet_clauses, facet_params = _search_facet_filters(domain, content_type, retrieved_after, retrieved_before)
+    clauses.extend(facet_clauses)
+    params.extend(facet_params)
     metadata_sql, metadata_params = _metadata_filter_sql(metadata_key, metadata_value)
+    where_sql = " AND ".join(clauses) + metadata_sql
+    params.extend(metadata_params)
+    params.append(limit)
     with connection() as conn:
-        rows=conn.execute(f"""SELECT v.id,v.source_id,v.version_number,v.title,s.canonical_url,v.body,v.retrieved_at,v.content_hash,s.current_version_id,snippet(versions_fts,1,'<mark>','</mark>',' … ',24) excerpt FROM versions_fts JOIN document_versions v ON v.id=versions_fts.rowid JOIN sources s ON s.id=v.source_id WHERE versions_fts MATCH ? {filter_sql} {metadata_sql} ORDER BY bm25(versions_fts,8.0,1.0),v.retrieved_at DESC LIMIT ?""",(match,*metadata_params,limit)).fetchall()
+        rows=conn.execute(f"""SELECT v.id,v.source_id,v.version_number,v.title,s.canonical_url,v.body,v.retrieved_at,v.content_hash,s.current_version_id,snippet(versions_fts,1,'<mark>','</mark>',' … ',24) excerpt FROM versions_fts JOIN document_versions v ON v.id=versions_fts.rowid JOIN sources s ON s.id=v.source_id WHERE {where_sql} ORDER BY bm25(versions_fts,8.0,1.0),v.retrieved_at DESC LIMIT ?""",params).fetchall()
     results = []
     for r in rows:
         explanation = _search_explanation(q, r["title"], r["body"], mode, field)
