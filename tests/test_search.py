@@ -149,3 +149,26 @@ def test_relationship_requires_exactly_one_object(client):
     })
     assert response.status_code == 422
 
+
+
+def test_search_and_documents_filter_by_current_metadata(client):
+    first = search_app.save_document('https://example.org/english', 'Archive language guide', 'A guide about archive language metadata.', 200, 'text/html')
+    second = search_app.save_document('https://example.org/french', 'Archive language notes', 'Notes about archive language metadata.', 200, 'text/html')
+    client.post(f"/sources/{first['source_id']}/metadata", json={'key': 'language', 'value': 'en'})
+    client.post(f"/sources/{second['source_id']}/metadata", json={'key': 'language', 'value': 'fr'})
+    client.post(f"/sources/{second['source_id']}/metadata", json={'key': 'language', 'value': 'en'})
+    client.post(f"/sources/{second['source_id']}/metadata", json={'key': 'reviewed', 'value': 'yes'})
+
+    by_key = client.get('/search', params={'q': 'archive language', 'metadata_key': 'language'})
+    assert by_key.status_code == 200 and len(by_key.json()) == 2
+    by_value = client.get('/search', params={'q': 'archive language', 'metadata_key': 'language', 'metadata_value': 'en'})
+    assert by_value.status_code == 200
+    assert {r['source_id'] for r in by_value.json()} == {first['source_id'], second['source_id']}
+    by_other_value = client.get('/search', params={'q': 'archive language', 'metadata_key': 'language', 'metadata_value': 'fr'})
+    assert by_other_value.json() == []
+    docs = client.get('/documents', params={'metadata_key': 'reviewed', 'metadata_value': 'yes'})
+    assert docs.status_code == 200 and [d['source_id'] for d in docs.json()] == [second['source_id']]
+
+def test_metadata_value_filter_requires_key(client):
+    response = client.get('/search', params={'q': 'anything', 'metadata_value': 'en'})
+    assert response.status_code == 422
