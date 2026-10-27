@@ -1,8 +1,25 @@
 # Records Search Engine
 
-A provenance-preserving search engine with a versioned STEM Wiki, typed STEM artifacts, structured metadata filters, typed entities, and evidence-aware relationships.
+A provenance-preserving search engine with versioned documents, structured metadata, typed entities, STEM artifacts, and evidence-aware relationships. This repository also serves as the **working registry for the owner-wide repository improvement program**.
+
+## Owner repository improvement registry
+
+The registry records repository assessments, planned work, completed changes, verification evidence, and cross-repository integration candidates. Update it whenever a repository is assessed or changed. Distinguish proposed work from completed work and never label a change verified until its relevant check has actually run.
+
+- [Repository Improvement Registry](REPOSITORY_IMPROVEMENT_REGISTRY.md) — master status table, queue, and cross-repository map.
+- [Improvement Log](IMPROVEMENT_LOG.md) — chronological log of assessments, decisions, commits, and verification outcomes.
+- [Repository Review Template](docs/repository-review-template.md) — repeatable checklist for assessing each repository.
+
+### Registry conventions
+
+- Statuses: `NOT_STARTED`, `IN_REVIEW`, `PLANNED`, `IN_PROGRESS`, `BLOCKED`, `DONE`, `VERIFIED`, `DEFERRED`.
+- Every work item should have an ID, target repository, concrete outcome, status, evidence/link, and next step.
+- `DONE` means the change was made; `VERIFIED` means the relevant checks or review were completed and their evidence is linked.
+- Relationship links between repositories are initially candidates until their interfaces/content have been reviewed.
+- Keep source repositories authoritative for their own content. The registry coordinates work; it does not silently replace source documents.
 
 ## Features
+
 - FastAPI JSON API and browser UI
 - HTTP/HTTPS HTML ingestion with a 2 MB response limit
 - GitHub repository text ingestion for public repositories or private repositories accessible to a configured `GITHUB_TOKEN`, preserving repository/ref/path/blob provenance
@@ -10,196 +27,52 @@ A provenance-preserving search engine with a versioned STEM Wiki, typed STEM art
 - Immutable document versions with content hashes, retrieval metadata, and extraction status
 - Changed content creates a new version; unchanged retrievals are logged without duplicate versions
 - SQLite FTS5 current-version search by default, with optional historical search
-- Search and document-list filters for current structured metadata keys and exact string values
-- Idempotent schema migration, including legacy v0.1 document migration
+- Search query modes, field scope, weighted ranking, explainable match details, and domain/content-type/retrieval-date filters
 - Typed entity registry and evidence-linked entity relationships with confidence and provenance
 - Append-only source metadata revisions with explicit supersession history
-- STEM Wiki with immutable page revisions, full-text search, discipline/language filters, tags, references, and provenance
-- Structured immutable STEM artifacts for equations, constants, algorithms, and experiments, with a JSON editor in the page view
-- Provenance-aware knowledge graph connecting wiki revisions and artifacts with typed, append-only relationships and bounded traversal
-- STEM artifact validation reports for missing definitions, units, sources, uncertainty, experiment controls, and dimensional checks for a documented subset of compound units
-- Immutable, versioned STEM validation rule-set registry with report-level validator and rule-set versions
+- Versioned STEM Wiki and structured STEM artifacts
+- Provenance-aware knowledge graph and versioned validation rules
 - Automated tests, GitHub Actions CI, and Docker Compose deployment
 
 ## Run locally
+
 ```bash
 python -m venv .venv
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
+
 Open http://127.0.0.1:8000; API docs: http://127.0.0.1:8000/docs.
 
 ## Test
+
 ```bash
 pytest -q
 ```
 
 ## Docker
+
 ```bash
 docker compose up --build
 ```
 
-## API examples
-```bash
-curl -X POST http://127.0.0.1:8000/ingest -H 'Content-Type: application/json' -d '{"url":"https://example.org/"}'
-curl 'http://127.0.0.1:8000/search?q=example'
-curl 'http://127.0.0.1:8000/search?q=example&include_history=true'
-curl 'http://127.0.0.1:8000/search?q=archive&metadata_key=language&metadata_value=en'
-curl 'http://127.0.0.1:8000/documents?metadata_key=reviewed&metadata_value=yes'
-curl -X POST http://127.0.0.1:8000/wiki/pages -H 'Content-Type: application/json' -d '{"slug":"newton-second-law","title":"Newton Second Law","body":"Net force equals mass times acceleration. F = m a.","discipline":"physics","tags":["mechanics"]}'
-curl 'http://127.0.0.1:8000/wiki/search?q=force&discipline=physics'
-curl 'http://127.0.0.1:8000/wiki/pages/newton-second-law?include_history=true'
-curl -X POST http://127.0.0.1:8000/wiki/pages/newton-second-law/artifacts -H 'Content-Type: application/json' -d '{"artifact_type":"equation","name":"Newton second law","data":{"expression":"F = m * a","variables":[{"symbol":"F","meaning":"net force","unit":"N"},{"symbol":"m","meaning":"mass","unit":"kg"},{"symbol":"a","meaning":"acceleration","unit":"m/s^2"}]}}'
-curl 'http://127.0.0.1:8000/wiki/pages/newton-second-law/artifacts?artifact_type=equation'
-curl -X POST http://127.0.0.1:8000/wiki/edges -H 'Content-Type: application/json' -d '{"subject_kind":"page","subject_id":1,"predicate":"includes equation","object_kind":"artifact","object_id":1,"status":"proposed","confidence":0.9}'
-curl 'http://127.0.0.1:8000/wiki/graph/page/1?depth=2'
-curl 'http://127.0.0.1:8000/wiki/validation-rule-sets'
-curl -X POST http://127.0.0.1:8000/wiki/artifacts/1/validate
-curl 'http://127.0.0.1:8000/wiki/artifacts/1/validation-reports'
-curl 'http://127.0.0.1:8000/sources'
-curl 'http://127.0.0.1:8000/documents?include_history=true'
-```
-
-
-## Owner-wide GitHub search and cross-repository navigation
-
-After indexing repositories with `POST /github/ingest-owner`, use:
-
-- `GET /github/search?q=provenance&owner=YOUR_OWNER` to search indexed GitHub files across repositories.
-- Add `repository=REPO_NAME` to narrow results, or `include_history=true` to search older file versions.
-- `GET /github/repositories?owner=YOUR_OWNER` to list indexed repositories, indexed-file counts, and navigation links.
-- `GET /github/repositories/OWNER/REPOSITORY` to browse indexed files with GitHub file URLs and local source/version-history links.
-- `POST /github/repository-relationships` to record an explicit cross-repository relationship between two indexed file sources. Body fields: `from_source_id`, `to_source_id`, `predicate`, and optional `confidence`, `status`, `provenance`.
-- `GET /github/repository-relationships?owner=YOUR_OWNER` to list those relationships with both endpoints' URLs and ingestion provenance.
-
-Cross-repository relationships are **explicit assertions**, not automatically inferred facts. They are append-only and immutable; use statuses `proposed`, `supported`, `disputed`, or `rejected` to preserve review state without silently rewriting history. Search and browse results expose local source and version-history navigation so a result can be traced back to its indexed file.
-
 ## GitHub repository ingestion
-`POST /github/ingest-repository` reads a bounded set of text files from a repository tree. By default it includes Markdown, plain text, source code, JSON/YAML, SQL, HTML/XML, TOML, and CSV files; binary files, unsupported extensions, common dependency/build directories, and files over 2 MB are skipped. `max_files` is limited to 100 per request. Each indexed file is stored through the existing immutable document-version pipeline, with repository, ref, path, Git blob SHA, and source URL in provenance. Re-ingesting unchanged content does not create a duplicate document version. Set `GITHUB_TOKEN` in the deployment environment to access private repositories allowed by that token; never send the token in request JSON. This first iteration is manually triggered, not an unattended full-account crawler.
 
-## Safety and scope
-Submit only sources you are authorized to retrieve; respect site terms, robots policies, rate limits, and copyright. The prototype blocks redirects, limits downloads, and only extracts HTML, but these controls do not eliminate all DNS-rebinding or network-level risks. Deploy behind egress controls for untrusted users. This is not a general crawler and does not bypass authentication or paywalls. Before public multi-user deployment, add authentication, rate limiting, stricter egress controls, and operational monitoring.
+For a bounded scan of an owner's accessible public repositories, the API provides `POST /github/ingest-owner`. Set `GITHUB_TOKEN` in the environment to allow access to private repositories that the token is authorized to read. This is a manually triggered ingestion flow, not an unattended crawler. Protect ingestion endpoints with authentication and appropriate network controls before exposing the service publicly.
 
-## Roadmap
-1. Source registry, immutable versions, and ingestion logs — implemented in v0.2.0
-2. Typed entity registry, relationships, and append-only metadata — implemented in v0.3.0
-3. Structured metadata filters for search and document listing — implemented in v0.4.0
-4. STEM Wiki — implemented in v0.5.0
-5. Structured STEM artifacts — implemented in v0.6.0
-6. STEM validation reports — implemented in v0.8.0 (screening aid; not a proof of correctness)
-7. Versioned validation rules and limited compound-unit dimensional checks — implemented in v0.9.0
-8. PostgreSQL migration, archive connectors, language detection, timelines, and evidence-conflict views
-
-
-## GitHub repository ingestion
-`POST /github/ingest-repository` reads a bounded set of text files from one repository. `POST /github/ingest-owner` scans up to 20 owned repositories per request and up to 50 files per repository, excluding forks and archived repositories. Each indexed file stores repository, ref, path, Git blob SHA, and source URL in provenance. Re-ingesting unchanged content does not create a duplicate document version. Public repositories are supported without credentials; private repositories require a deployment-configured GitHub access token with permission to read them. Do not pass credentials in request JSON. This first iteration is manually triggered, not an unattended background crawler.
-
-
-## Cross-repository relationship candidate discovery
-
-Use `GET /github/relationship-candidates?owner=YOUR_OWNER` to generate a bounded shortlist of potential links between indexed files in different repositories. The detector looks for explicit GitHub blob links, shared structured identifiers (such as ticket IDs, UUIDs, and DOI-like identifiers), import/dependency names that match file paths, and shared distinctive terms.
-
-Optional parameters:
-- `max_sources` (2–500, default 300): maximum current file sources to examine.
-- `min_score` (1–100, default 10): minimum heuristic score to return.
-- `limit` (1–200, default 50): maximum candidate links returned.
-
-Every candidate includes its two file endpoints, score, evidence categories, and a suggested relationship predicate. Results are labeled `candidate_only` and require review. The detector does **not** automatically create graph edges or save candidate relationships. After reviewing a candidate, use `POST /github/repository-relationships` to record an explicit, provenance-linked assertion when justified. The current scan is bounded and examines pairs within the selected current-source set; if `scan_truncated` is true, increase `max_sources` or index/filter the repositories more narrowly. A heuristic score is a ranking aid, not a probability or proof.
-
-
-## Relationship review and graph
-
-- `POST /github/relationship-reviews` records an immutable review decision. Use `decision=accepted`, `rejected`, or `disputed`, and provide reviewer, rationale, confidence, evidence snapshot, and provenance as appropriate.
-- An accepted review creates a `supported` cross-repository relationship. Rejected or disputed reviews remain in the review log and do not create a supported graph edge.
-- `GET /github/relationship-reviews?owner=YOUR_OWNER` lists decisions; add `decision=accepted|rejected|disputed` to filter.
-- `GET /github/relationship-graph?owner=YOUR_OWNER` returns a JSON graph with file/source nodes and explicit stored relationship edges. By default, it includes supported edges only. Add `include_proposed=true` to include proposed and disputed edges too.
-- Graph nodes include source and version-history navigation. Edge provenance records the reviewed source versions and the review rationale/evidence snapshot when the edge was accepted.
-
-Review decisions and relationship records are append-only. A later disagreement should be recorded as another review, not as an edit to an earlier decision. The graph API returns data for a visualization client; it does not itself draw an interactive graph.
-
-## Relationship evidence change detection
-
-When an indexed source receives a new content version, the system appends an immutable change event for each stored relationship touching that source. The event records the previous and current version IDs and content hashes, the version captured by the relationship review when available, and a recommendation for human revalidation. It does **not** automatically reject, delete, or silently rewrite the relationship.
-
-- `GET /github/relationship-change-events?owner=YOUR_OWNER` lists change events involving the owner's repositories.
-- Add `relationship_id=123` or `source_id=456` to narrow the results.
-- Events are append-only and duplicate detection is guarded by a unique relationship/source/current-version key.
-- An unchanged re-ingestion does not create a new document version or a relationship change event.
-
-These events indicate that evidence may be stale; they do not establish that a relationship is false. The next review workflow can record a fresh decision against the new exact versions.
-
-## Relationship revalidation and resolution
-
-### Exact-version comparison
-
-Use `GET /github/relationship-change-comparisons?event_id=123` to inspect the exact previous/current versions referenced by a change event. The response contains a unified line diff, version IDs, SHA-256 hashes, added/removed line counts, and a bounded excerpt of the other relationship endpoint's current version for context. Output is bounded by `max_diff_lines` (default 1,500; maximum 5,000) and the other-endpoint excerpt by `context_chars` (default 12,000; maximum 30,000). A `stored_hashes_match_versions` flag checks that event hashes match the version records.
-
-The explorer's **Compare exact source versions** control loads this diff and context. This is a textual comparison, not a semantic judgement; reviewers should inspect the linked source files and decide whether the relationship remains supported. A truncated diff reports its limit and should not be treated as a complete comparison.
-
-The browser explorer at `/github/explorer` also displays unresolved change events and provides controls to reaffirm, revise, dispute, or mark a relationship no longer supported. It includes the old/current version IDs and content hashes for review. Reviewers should open and compare the source files before submitting a decision; the UI's evidence snapshot is a record of the displayed version identifiers, not an automatic semantic diff.
-
-When a source-change event exists, a reviewer can record one immutable revalidation decision with `POST /github/relationship-revalidations`. The request includes `event_id`, `decision`, and a required `rationale`; it can also include reviewer, predicate, confidence, evidence snapshot, and provenance.
-
-Supported decisions:
-
-- `reaffirmed`: the relationship remains supported after reviewing current versions.
-- `revised`: the relationship remains supported but its predicate or interpretation is revised.
-- `disputed`: the relationship is not currently confirmed and needs further resolution.
-- `no_longer_supported`: the reviewer found the current evidence no longer supports the relationship.
-
-Reaffirmed and revised decisions create a new supported relationship record with the exact current source version IDs. The earlier relationship and all earlier decisions remain in the audit history. A disputed or no-longer-supported decision does not create a replacement edge; the old edge is omitted from the current graph while its historical record remains intact.
-
-- `GET /github/relationship-revalidations?owner=YOUR_OWNER` lists decisions.
-- Add `relationship_id=123` to filter by the prior relationship.
-- Each change event can receive one revalidation decision. A later content change creates a new event and review opportunity.
-
-The reviewer should compare the changed source against the other endpoint's current content, and provide the actual version IDs examined in `evidence_snapshot`. Decisions are human assertions, not automatic conclusions inferred from change detection.
-
-## Search query controls
-
-Both `GET /search` and `GET /github/search` accept `mode` and `field` parameters. Matching uses SQLite FTS5; queries are treated as plain-text tokens rather than arbitrary FTS expressions.
-
-- `mode=all` (default): every term must match.
-- `mode=any`: at least one term must match.
-- `mode=phrase`: terms must occur as an adjacent phrase.
-- `mode=prefix`: every term is matched as a token prefix, useful for partial words.
-- `field=both` (default): search titles and body text.
-- `field=title` or `field=body`: restrict matching to that field.
-
-Examples:
+## Search API examples
 
 ```bash
-curl 'http://127.0.0.1:8000/search?q=identity%20record&mode=any'
-curl 'http://127.0.0.1:8000/search?q=identity%20record&mode=phrase'
-curl 'http://127.0.0.1:8000/search?q=auth&mode=prefix&field=title'
-curl 'http://127.0.0.1:8000/github/search?q=dependency&mode=any&field=body'
+curl 'http://127.0.0.1:8000/search?q=record&mode=all&field=both'
+curl 'http://127.0.0.1:8000/search?q=record%20lineage&mode=phrase&field=title'
+curl 'http://127.0.0.1:8000/search?q=record&mode=any&domain=github.com&content_type=text/*'
+curl 'http://127.0.0.1:8000/search?q=record&retrieved_after=2026-01-01'
+curl 'http://127.0.0.1:8000/github/search?q=provenance&owner=bradgeigermanager-sketch'
+curl 'http://127.0.0.1:8000/github/relationship-candidates?owner=bradgeigermanager-sketch'
 ```
 
+Relevance scores are ranking aids, not probabilities, truth judgments, or source-quality ratings. Relationship candidates are suggestions; only reviewed, explicitly recorded relationships should be treated as accepted graph edges.
 
-## Relevance ranking and match explanations
+## Cross-repository improvement program
 
-Search now weights title matches more heavily than body-only matches in SQLite FTS5 ranking. This applies to both `/search` and `/github/search`, while preserving the selected matching mode, field scope, current-version behavior, metadata filters, and repository filters.
-
-Each result includes:
-- `matched_terms`: query terms found in the eligible title/body fields (prefix-aware in prefix mode).
-- `match_reasons`: human-readable explanation such as title matches, body matches, or a full-query/phrase occurrence.
-- `relevance_score`: a transparent rule-based score from 0 to 100. It is a ranking aid, **not** a probability, truth rating, or source-quality assessment.
-
-The score favors query-term coverage in titles, then body text, with a phrase bonus. FTS5's weighted ranking orders the results; the explanation fields show why each result matched. A high score does not validate a source's claims.
-
-## Search filters: domain, media type, and retrieval date
-
-Both `GET /search` and `GET /github/search` support additional optional filters:
-- `domain`: exact hostname match, e.g. `domain=example.org` (does not include subdomains).
-- `content_type`: media-type match by prefix, e.g. `text/plain`; a trailing wildcard such as `text/*` matches a media-type family.
-- `retrieved_after` and `retrieved_before`: inclusive ISO 8601 date or datetime bounds. Naive dates/times are interpreted as UTC. If both are supplied, the lower bound must not exceed the upper bound.
-
-These filters combine with the search mode, field scope, current-version default, metadata filters, and (for GitHub search) owner/repository constraints.
-
-Examples:
-
-```bash
-curl 'http://127.0.0.1:8000/search?q=identity&domain=example.org&content_type=text/plain'
-curl 'http://127.0.0.1:8000/search?q=policy&retrieved_after=2026-01-01&retrieved_before=2026-12-31'
-curl 'http://127.0.0.1:8000/github/search?q=dependency&owner=example&content_type=text/*'
-```
+The initial priority is to inventory each repository, clarify its purpose and implementation status, improve its README/entry points, identify overlapping concepts, and propose shared versioned schemas and interfaces. Changes should be incremental, attributable to commits, and tested where executable code exists. See the registry and log linked above.
