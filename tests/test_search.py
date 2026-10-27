@@ -812,6 +812,8 @@ def test_explorer_includes_stale_evidence_revalidation_controls(client):
     assert response.status_code == 200
     assert 'Stale evidence awaiting review' in response.text
     assert '/github/relationship-change-events' in response.text
+    assert '/github/relationship-change-comparisons' in response.text
+    assert 'Compare exact source versions' in response.text
     assert '/github/relationship-revalidations' in response.text
     assert 'no_longer_supported' in response.text
 
