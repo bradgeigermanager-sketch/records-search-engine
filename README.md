@@ -127,3 +127,22 @@ When an indexed source receives a new content version, the system appends an imm
 - An unchanged re-ingestion does not create a new document version or a relationship change event.
 
 These events indicate that evidence may be stale; they do not establish that a relationship is false. The next review workflow can record a fresh decision against the new exact versions.
+
+## Relationship revalidation and resolution
+
+When a source-change event exists, a reviewer can record one immutable revalidation decision with `POST /github/relationship-revalidations`. The request includes `event_id`, `decision`, and a required `rationale`; it can also include reviewer, predicate, confidence, evidence snapshot, and provenance.
+
+Supported decisions:
+
+- `reaffirmed`: the relationship remains supported after reviewing current versions.
+- `revised`: the relationship remains supported but its predicate or interpretation is revised.
+- `disputed`: the relationship is not currently confirmed and needs further resolution.
+- `no_longer_supported`: the reviewer found the current evidence no longer supports the relationship.
+
+Reaffirmed and revised decisions create a new supported relationship record with the exact current source version IDs. The earlier relationship and all earlier decisions remain in the audit history. A disputed or no-longer-supported decision does not create a replacement edge; the old edge is omitted from the current graph while its historical record remains intact.
+
+- `GET /github/relationship-revalidations?owner=YOUR_OWNER` lists decisions.
+- Add `relationship_id=123` to filter by the prior relationship.
+- Each change event can receive one revalidation decision. A later content change creates a new event and review opportunity.
+
+The reviewer should compare the changed source against the other endpoint's current content, and provide the actual version IDs examined in `evidence_snapshot`. Decisions are human assertions, not automatic conclusions inferred from change detection.
