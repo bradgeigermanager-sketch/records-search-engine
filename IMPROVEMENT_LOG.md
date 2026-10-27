@@ -122,3 +122,11 @@ Copy this section for each substantive action:
 - **Verification:** [Expanded CI run](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453597735) passed. It checked both schemas against Draft 2020-12 and validated the assessment example plus negative cases for unsafe eligibility, missing rationale, and out-of-range confidence.
 - **Remaining limitations:** The decision table is a policy draft; the schema only enforces a subset of its rules. The original independent-observations example remains a conceptual fixture rather than a schema-validated DeduplicationRecordIR instance.
 - **Next:** Add valid/invalid record fixtures for the record schema, test relationship-code and action compatibility, inspect the rest of the owner repository inventory, and keep the registry/log synchronized.
+
+
+### `LOG-2026-10-26-013` — Add a valid record fixture and preserve-originals regression
+- **Repository:** [Records-Deduplication-Suite](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite)
+- **Action:** Added a synthetic valid `DeduplicationRecordIR` fixture and extended CI to validate it against the record schema, plus reject a fixture whose `original_values_preserved` invariant is false.
+- **Commits:** [Record fixture](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/commit/b3dcb7ef35bccda26f22606bf4cca3051b850304); [expanded workflow](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/commit/b97f665e6d040b4bc193edc150d900394669b249).
+- **Verification:** Previous assessment-schema checks passed in [run 40453597735](https://github.com/bradgeigermanager-sketch/Records-Deduplication-Suite/actions/runs/40453597735). The new record-fixture run and expanded workflow result remain pending at the time of this entry.
+- **Next:** Confirm the latest workflow; if green, add relationship/action compatibility cases and then inspect the next unreviewed repository from the owner inventory.
