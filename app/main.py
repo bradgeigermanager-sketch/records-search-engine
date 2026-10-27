@@ -1,6 +1,6 @@
 """Records Search Engine — source registry and immutable content versions."""
 from __future__ import annotations
-import base64, hashlib, ipaddress, json, math, os, re, socket, sqlite3
+import base64, difflib, hashlib, ipaddress, json, math, os, re, socket, sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urldefrag, urlunparse, quote
@@ -1790,6 +1790,60 @@ def list_github_relationship_change_events(owner: str | None = None,
         "relationship_status_at_change": r["relationship_status"], "predicate": r["predicate"],
         "reason": r["reason"], "created_at": r["created_at"],
         "revalidation_recommended": True} for r in rows]
+
+
+
+@app.get("/github/relationship-change-comparisons")
+def compare_github_relationship_change(event_id: int = Query(ge=1),
+                                       context_chars: int = Query(default=12000, ge=1000, le=30000),
+                                       max_diff_lines: int = Query(default=1500, ge=100, le=5000)):
+    """Return a bounded unified diff for the exact old/current versions named by a change event."""
+    with connection() as conn:
+        row = conn.execute("""SELECT e.*,rr.from_source_id,rr.to_source_id,rr.predicate,
+            old.title previous_title,old.body previous_body,old.content_hash actual_previous_hash,
+            current.title current_title,current.body current_body,current.content_hash actual_current_hash,
+            s.canonical_url changed_source_url,json_extract(s.provenance_json,'$.repository') changed_repository,
+            json_extract(s.provenance_json,'$.path') changed_path,
+            other.current_version_id other_current_version_id
+            FROM relationship_change_events e
+            JOIN repository_relationships rr ON rr.id=e.relationship_id
+            JOIN document_versions old ON old.id=e.previous_version_id
+            JOIN document_versions current ON current.id=e.current_version_id
+            JOIN sources s ON s.id=e.source_id
+            JOIN sources other ON other.id=CASE WHEN e.source_id=rr.from_source_id THEN rr.to_source_id ELSE rr.from_source_id END
+            WHERE e.id=?""", (event_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Relationship change event or its source versions were not found")
+        other_version = conn.execute("SELECT id,title,body,content_hash FROM document_versions WHERE id=?",
+                                     (row["other_current_version_id"],)).fetchone() if row["other_current_version_id"] else None
+    old_lines = (row["previous_body"] or "").splitlines()
+    new_lines = (row["current_body"] or "").splitlines()
+    diff_lines = list(difflib.unified_diff(old_lines, new_lines,
+        fromfile=f"version-{row['previous_version_id']} (previous)",
+        tofile=f"version-{row['current_version_id']} (current)", lineterm=""))
+    truncated = len(diff_lines) > max_diff_lines
+    diff_lines = diff_lines[:max_diff_lines]
+    old_hash_matches = row["actual_previous_hash"] == row["previous_content_hash"]
+    new_hash_matches = row["actual_current_hash"] == row["current_content_hash"]
+    return {
+        "event_id": event_id, "relationship_id": row["relationship_id"], "predicate": row["predicate"],
+        "source_id": row["source_id"], "source_url": row["changed_source_url"],
+        "source_repository": row["changed_repository"], "source_path": row["changed_path"],
+        "previous_version_id": row["previous_version_id"], "current_version_id": row["current_version_id"],
+        "previous_title": row["previous_title"], "current_title": row["current_title"],
+        "previous_content_hash": row["previous_content_hash"], "current_content_hash": row["current_content_hash"],
+        "stored_hashes_match_versions": old_hash_matches and new_hash_matches,
+        "previous_line_count": len(old_lines), "current_line_count": len(new_lines),
+        "added_lines": sum(1 for line in diff_lines if line.startswith("+") and not line.startswith("+++")),
+        "removed_lines": sum(1 for line in diff_lines if line.startswith("-") and not line.startswith("---")),
+        "diff_lines": diff_lines, "diff_truncated": truncated, "diff_line_limit": max_diff_lines,
+        "other_endpoint_current_version": ({
+            "version_id": other_version["id"], "title": other_version["title"],
+            "content_hash": other_version["content_hash"],
+            "body_excerpt": (other_version["body"] or "")[:context_chars]
+        } if other_version else None),
+        "note": "This is a textual line diff, not a semantic assessment. Confirm both versions and the other endpoint before deciding."
+    }
 
 
 @app.get("/github/explorer", response_class=HTMLResponse)
