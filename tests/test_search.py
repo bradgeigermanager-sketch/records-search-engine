@@ -172,3 +172,51 @@ def test_search_and_documents_filter_by_current_metadata(client):
 def test_metadata_value_filter_requires_key(client):
     response = client.get('/search', params={'q': 'anything', 'metadata_value': 'en'})
     assert response.status_code == 422
+
+
+def test_stem_wiki_create_search_filter_and_revision_history(client):
+    created = client.post('/wiki/pages', json={
+        'slug': 'newton-second-law', 'title': "Newton's Second Law",
+        'summary': 'Relationship between force, mass, and acceleration.',
+        'body': 'The net force on an object equals its mass multiplied by its acceleration. F = m a.',
+        'discipline': 'physics', 'language': 'en',
+        'tags': ['mechanics', 'classical physics'],
+        'references': [{'title': 'Example reference', 'url': 'https://example.org/physics'}],
+        'author': 'test', 'provenance': {'review_status': 'unreviewed'}
+    })
+    assert created.status_code == 200
+    assert created.json()['revision_number'] == 1
+    found = client.get('/wiki/search', params={'q': 'force acceleration'})
+    assert found.status_code == 200 and found.json()[0]['slug'] == 'newton-second-law'
+    filtered = client.get('/wiki/pages', params={'discipline': 'physics', 'tag': 'mechanics'})
+    assert filtered.status_code == 200 and filtered.json()[0]['title'] == "Newton's Second Law"
+
+    revised = client.post('/wiki/pages/newton-second-law/revisions', json={
+        'title': "Newton's Second Law", 'summary': 'Updated explanation.',
+        'body': 'Net force equals mass times acceleration. F = m a.',
+        'discipline': 'physics', 'language': 'en', 'tags': ['mechanics'],
+        'change_note': 'Clarified wording', 'provenance': {'review_status': 'reviewed'}
+    })
+    assert revised.status_code == 200 and revised.json()['revision_number'] == 2
+    assert client.get('/wiki/pages/newton-second-law').json()['revision_number'] == 2
+    history = client.get('/wiki/pages/newton-second-law', params={'include_history': 'true'}).json()
+    assert [r['revision_number'] for r in history['revisions']] == [2, 1]
+    assert client.get('/wiki/search', params={'q': 'relationship force'}).json() == []
+
+def test_stem_wiki_duplicate_slug_and_missing_page(client):
+    payload = {'slug': 'unit-test-page', 'title': 'Unit Test', 'body': 'Sample body', 'discipline': 'mathematics'}
+    assert client.post('/wiki/pages', json=payload).status_code == 200
+    assert client.post('/wiki/pages', json=payload).status_code == 409
+    assert client.get('/wiki/pages/does-not-exist').status_code == 404
+    assert client.post('/wiki/pages/does-not-exist/revisions', json={
+        'title': 'Missing', 'body': 'Missing page body', 'discipline': 'mathematics'
+    }).status_code == 404
+
+def test_wiki_revisions_are_immutable(client):
+    client.post('/wiki/pages', json={'slug': 'immutable-wiki', 'title': 'Immutable', 'body': 'Original body', 'discipline': 'engineering'})
+    with search_app.connection() as conn:
+        revision_id = conn.execute('SELECT id FROM wiki_page_revisions').fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('UPDATE wiki_page_revisions SET title=? WHERE id=?', ('Edited in place', revision_id))
+        with pytest.raises(sqlite3.IntegrityError, match='immutable'):
+            conn.execute('DELETE FROM wiki_page_revisions WHERE id=?', (revision_id,))
