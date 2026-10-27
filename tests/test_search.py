@@ -567,3 +567,39 @@ def test_cross_repository_relationships_are_explicit_and_immutable(client):
             conn.execute('UPDATE repository_relationships SET status=? WHERE id=?', ('supported', relationship['relationship_id']))
         with pytest.raises(sqlite3.IntegrityError, match='immutable'):
             conn.execute('DELETE FROM repository_relationships WHERE id=?', (relationship['relationship_id'],))
+
+
+def test_github_relationship_candidate_discovery_is_explainable_and_non_persistent(client):
+    first = search_app.save_document(
+        'https://github.com/example-owner/process-a/blob/main/README.md',
+        'example-owner/process-a: README.md',
+        'Implementation specification for tracking OPS-20261026 and process lineage.',
+        200, 'text/plain; charset=utf-8',
+        {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'process-a',
+         'ref': 'main', 'path': 'README.md', 'repository_url': 'https://github.com/example-owner/process-a'})
+    second = search_app.save_document(
+        'https://github.com/example-owner/process-b/blob/main/guide.md',
+        'example-owner/process-b: guide.md',
+        'Validation guide references OPS-20261026 and confirms process lineage.',
+        200, 'text/plain; charset=utf-8',
+        {'method': 'github_repository_ingestion', 'owner': 'example-owner', 'repository': 'process-b',
+         'ref': 'main', 'path': 'guide.md', 'repository_url': 'https://github.com/example-owner/process-b'})
+    response = client.get('/github/relationship-candidates', params={'owner': 'example-owner'})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['sources_scanned'] == 2
+    assert payload['scan_truncated'] is False
+    assert payload['candidate_count_returned'] >= 1
+    candidate = next(c for c in payload['candidates']
+                     if {c['from_source_id'], c['to_source_id']} == {first['source_id'], second['source_id']})
+    assert candidate['status'] == 'candidate_only'
+    assert candidate['review_required'] is True
+    assert any(e['type'] == 'shared_identifier' and 'ops-20261026' in e['values']
+               for e in candidate['evidence'])
+    assert client.get('/github/repository-relationships', params={'owner': 'example-owner'}).json() == []
+
+
+def test_github_relationship_candidate_discovery_requires_owner_and_bounds(client):
+    assert client.get('/github/relationship-candidates').status_code == 422
+    assert client.get('/github/relationship-candidates', params={'owner': 'example-owner', 'max_sources': 501}).status_code == 422
+    assert client.get('/github/relationship-candidates', params={'owner': '../bad'}).status_code == 422
