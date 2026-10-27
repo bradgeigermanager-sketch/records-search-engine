@@ -93,3 +93,15 @@ Submit only sources you are authorized to retrieve; respect site terms, robots p
 
 ## GitHub repository ingestion
 `POST /github/ingest-repository` reads a bounded set of text files from one repository. `POST /github/ingest-owner` scans up to 20 owned repositories per request and up to 50 files per repository, excluding forks and archived repositories. Each indexed file stores repository, ref, path, Git blob SHA, and source URL in provenance. Re-ingesting unchanged content does not create a duplicate document version. Public repositories are supported without credentials; private repositories require a deployment-configured GitHub access token with permission to read them. Do not pass credentials in request JSON. This first iteration is manually triggered, not an unattended background crawler.
+
+
+## Cross-repository relationship candidate discovery
+
+Use `GET /github/relationship-candidates?owner=YOUR_OWNER` to generate a bounded shortlist of potential links between indexed files in different repositories. The detector looks for explicit GitHub blob links, shared structured identifiers (such as ticket IDs, UUIDs, and DOI-like identifiers), import/dependency names that match file paths, and shared distinctive terms.
+
+Optional parameters:
+- `max_sources` (2–500, default 300): maximum current file sources to examine.
+- `min_score` (1–100, default 10): minimum heuristic score to return.
+- `limit` (1–200, default 50): maximum candidate links returned.
+
+Every candidate includes its two file endpoints, score, evidence categories, and a suggested relationship predicate. Results are labeled `candidate_only` and require review. The detector does **not** automatically create graph edges or save candidate relationships. After reviewing a candidate, use `POST /github/repository-relationships` to record an explicit, provenance-linked assertion when justified. The current scan is bounded and examines pairs within the selected current-source set; if `scan_truncated` is true, increase `max_sources` or index/filter the repositories more narrowly. A heuristic score is a ranking aid, not a probability or proof.
