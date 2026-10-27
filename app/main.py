@@ -14,8 +14,8 @@ APP_NAME = "Records Search Engine"
 DB_PATH = os.getenv("SEARCH_DB_PATH", "search.db")
 MAX_BYTES = 2_000_000
 TIMEOUT_SECONDS = 12
-USER_AGENT = "RecordsSearchEngine/0.8 (+responsible research; contact site operator before bulk use)"
-app = FastAPI(title=APP_NAME, version="0.8.0", description="Provenance-preserving web-record search prototype")
+USER_AGENT = "RecordsSearchEngine/0.9 (+responsible research; contact site operator before bulk use)"
+app = FastAPI(title=APP_NAME, version="0.9.0", description="Provenance-preserving web-record search prototype")
 
 class IngestRequest(BaseModel):
     url: HttpUrl
@@ -307,6 +307,18 @@ def init_db():
             CREATE TRIGGER IF NOT EXISTS stem_validation_no_delete BEFORE DELETE ON stem_validation_reports BEGIN SELECT RAISE(ABORT,'validation reports are immutable'); END;
             """)
             conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(6,?)", (utc_now(),))
+        if 7 not in applied:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS stem_validation_rule_sets (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL,
+                rules_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(name,version)
+            );
+            CREATE TRIGGER IF NOT EXISTS stem_validation_rule_sets_no_update BEFORE UPDATE ON stem_validation_rule_sets BEGIN SELECT RAISE(ABORT,'validation rule sets are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS stem_validation_rule_sets_no_delete BEFORE DELETE ON stem_validation_rule_sets BEGIN SELECT RAISE(ABORT,'validation rule sets are immutable'); END;
+            """)
+            conn.execute("""INSERT OR IGNORE INTO stem_validation_rule_sets(name,version,rules_json,created_at) VALUES(?,?,?,?)""",
+                ("stem-core","0.2",json.dumps({"equation":["expression_required","variables_defined","coarse_dimensional_check"],"constant":["value_finite","unit_required","source_review","uncertainty_review"],"algorithm":["pseudocode_required","interface_review","preconditions_review","complexity_review"],"experiment":["procedure_complete","variables_defined","controls_review","replication_review","uncertainty_review","safety_review"]}, sort_keys=True),utc_now()))
+            conn.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(7,?)", (utc_now(),))
 
 @app.on_event("startup")
 def startup():
@@ -664,6 +676,32 @@ def list_knowledge_edges(subject_kind: str | None = None, subject_id: int | None
              "status": r["status"], "provenance": json.loads(r["provenance_json"]), "created_at": r["created_at"]}
             for r in rows]
 
+def _unit_dimension(unit: str):
+    """Return coarse dimensions for a supported unit expression, or None if unsupported."""
+    base = {
+        "m": {"L": 1}, "cm": {"L": 1}, "km": {"L": 1}, "s": {"T": 1}, "min": {"T": 1}, "h": {"T": 1},
+        "kg": {"M": 1}, "g": {"M": 1}, "N": {"M": 1, "L": 1, "T": -2},
+        "J": {"M": 1, "L": 2, "T": -2}, "W": {"M": 1, "L": 2, "T": -3},
+        "Hz": {"T": -1}, "A": {"I": 1}, "K": {"Theta": 1}, "mol": {"Amount": 1},
+        "rad": {}, "dimensionless": {}, "1": {},
+    }
+    text_unit = unit.replace(" ", "")
+    if text_unit in base:
+        return base[text_unit]
+    import re
+    tokens = re.findall(r"([*/]?)([A-Za-z]+|1)(?:\^(-?\d+))?", text_unit)
+    rebuilt = "".join((op or "") + name + (("^" + power) if power else "") for op, name, power in tokens)
+    if not tokens or rebuilt != text_unit:
+        return None
+    dims = {}
+    for index, (op, name, power) in enumerate(tokens):
+        if name not in base or (op == "" and index > 0):
+            return None
+        exponent = int(power or "1") * (-1 if op == "/" else 1)
+        for dimension, dimension_power in base[name].items():
+            dims[dimension] = dims.get(dimension, 0) + dimension_power * exponent
+    return {key: value for key, value in dims.items() if value}
+
 def _validate_stem_data(artifact_type: str, data: dict) -> dict:
     errors, warnings, checks = [], [], []
     if artifact_type == "equation":
@@ -692,14 +730,14 @@ def _validate_stem_data(artifact_type: str, data: dict) -> dict:
                     warnings.append(f"Variable '{symbol or index}' has no meaning/definition.")
         if "lhs_unit" in data and "rhs_unit" in data:
             lhs, rhs = data["lhs_unit"], data["rhs_unit"]
-            dimensions = {"m":"length","cm":"length","km":"length","s":"time","min":"time","kg":"mass","g":"mass","N":"force","J":"energy","W":"power","m/s":"speed","m/s^2":"acceleration"}
-            if lhs in dimensions and rhs in dimensions:
-                if dimensions[lhs] != dimensions[rhs]:
+            lhs_dimensions, rhs_dimensions = _unit_dimension(lhs), _unit_dimension(rhs)
+            if lhs_dimensions is not None and rhs_dimensions is not None:
+                if lhs_dimensions != rhs_dimensions:
                     errors.append(f"Declared equation side units are dimensionally incompatible: {lhs} vs {rhs}.")
                 else:
-                    checks.append(f"Declared side units share the same coarse dimension: {lhs} and {rhs}.")
+                    checks.append(f"Declared side units are dimensionally compatible: {lhs} and {rhs}.")
             else:
-                warnings.append("Dimensional comparison was skipped because one or both units are not in the limited built-in unit map.")
+                warnings.append("Dimensional comparison was skipped because one or both units use unsupported unit syntax or symbols.")
         else:
             warnings.append("No lhs_unit/rhs_unit pair supplied; equation dimensional consistency was not evaluated.")
     elif artifact_type == "constant":
@@ -749,6 +787,12 @@ def _validate_stem_data(artifact_type: str, data: dict) -> dict:
     return {"outcome": outcome, "errors": errors, "warnings": warnings, "checks": checks,
             "note": "Automated validation is a screening aid, not proof of scientific correctness."}
 
+@app.get("/wiki/validation-rule-sets")
+def list_stem_validation_rule_sets():
+    with connection() as conn:
+        rows = conn.execute("SELECT id,name,version,rules_json,created_at FROM stem_validation_rule_sets ORDER BY name,version").fetchall()
+    return [{"rule_set_id": r["id"], "name": r["name"], "version": r["version"], "rules": json.loads(r["rules_json"]), "created_at": r["created_at"]} for r in rows]
+
 @app.post("/wiki/artifacts/{artifact_id}/validate")
 def validate_stem_artifact(artifact_id: int):
     with connection() as conn:
@@ -756,10 +800,12 @@ def validate_stem_artifact(artifact_id: int):
         if not artifact:
             raise HTTPException(status_code=404, detail="STEM artifact not found")
         result = _validate_stem_data(artifact["artifact_type"], json.loads(artifact["data_json"]))
+        rule_set = conn.execute("SELECT name,version FROM stem_validation_rule_sets WHERE name='stem-core' ORDER BY id DESC LIMIT 1").fetchone()
+        validator_version = "0.2"
+        rule_set_name, rule_set_version = (rule_set["name"], rule_set["version"]) if rule_set else ("stem-core", "0.2")
         now = utc_now()
-        cur = conn.execute("""INSERT INTO stem_validation_reports(artifact_id,validator_version,outcome,findings_json,created_at)
-            VALUES(?,?,?,?,?)""", (artifact_id, "0.1", result["outcome"], json.dumps(result, ensure_ascii=False, sort_keys=True), now))
-    return {"report_id": cur.lastrowid, "artifact_id": artifact_id, "validator_version": "0.1",
+        cur = conn.execute("""INSERT INTO stem_validation_reports(artifact_id,validator_version,outcome,findings_json,created_at) VALUES(?,?,?,?,?)""", (artifact_id, validator_version, result["outcome"], json.dumps(result, ensure_ascii=False, sort_keys=True), now))
+    return {"report_id": cur.lastrowid, "artifact_id": artifact_id, "validator_version": validator_version, "rule_set": {"name": rule_set_name, "version": rule_set_version},
             **result, "created_at": now}
 
 @app.get("/wiki/artifacts/{artifact_id}/validation-reports")
